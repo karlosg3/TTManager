@@ -87,7 +87,6 @@ cargo build --release
 sys_monitor/
 ├── Cargo.toml      # Configuración del paquete y dependencias
 ├── Cargo.lock      # Versiones bloqueadas de dependencias
-├── IMPLEMENT.md    # Especificación de requerimientos y bitácora técnica
 ├── README.md       # Documentación completa del proyecto
 └── src/
     ├── main.rs     # Orquestador del ciclo de vida, parser CLI y bucle de eventos
