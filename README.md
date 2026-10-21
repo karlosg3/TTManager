@@ -70,6 +70,10 @@ tar -xzf ttm-vX.Y.Z-linux-x86_64.tar.gz
 ./ttm
 ```
 
+### Publicar una versión
+
+Los releases son automáticos: al fusionar en `main` un cambio que suba `version` en `Cargo.toml` (por ejemplo a `0.2.0`), el workflow `Release` crea el tag `v0.2.0`, compila y publica el binario. Si la versión ya tiene tag, no hace nada.
+
 ### Compilación para Producción
 
 ```bash

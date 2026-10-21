@@ -1,11 +1,19 @@
 name: Release
 
+# Publica un release cuando la versión de Cargo.toml en main aún no tiene tag.
+# Para sacar una versión: subir `version` en Cargo.toml dentro de un PR y fusionarlo.
+
 on:
   push:
-    tags: ["v*"]
+    branches: ["main"]
+  workflow_dispatch:
 
 permissions:
   contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -18,31 +26,43 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    - name: Check tag matches Cargo.toml version
+    - name: Read version and check for existing tag
+      id: version
       run: |
         version=$(cargo metadata --no-deps --format-version 1 | python3 -c "import sys, json; print(json.load(sys.stdin)['packages'][0]['version'])")
-        if [ "v$version" != "${{ github.ref_name }}" ]; then
-          echo "Tag ${{ github.ref_name }} does not match Cargo.toml version v$version"
-          exit 1
+        tag="v$version"
+        if git ls-remote --exit-code --tags origin "refs/tags/$tag" > /dev/null; then
+          echo "Tag $tag already exists, nothing to release."
+          echo "needed=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "Tag $tag not found, releasing."
+          echo "needed=true" >> "$GITHUB_OUTPUT"
         fi
+        echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
     - name: Test
+      if: steps.version.outputs.needed == 'true'
       run: cargo test --locked
 
     - name: Build
+      if: steps.version.outputs.needed == 'true'
       run: cargo build --release --locked
 
     - name: Package
+      if: steps.version.outputs.needed == 'true'
       run: |
-        name="ttm-${{ github.ref_name }}-linux-x86_64"
+        name="ttm-${{ steps.version.outputs.tag }}-linux-x86_64"
         mkdir "$name"
         cp target/release/ttm LICENSE README.md "$name/"
         tar -czf "$name.tar.gz" "$name"
         sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
 
     - name: Publish release
+      if: steps.version.outputs.needed == 'true'
       uses: softprops/action-gh-release@v2
       with:
+        tag_name: ${{ steps.version.outputs.tag }}
+        target_commitish: ${{ github.sha }}
         files: |
           ttm-*.tar.gz
           ttm-*.tar.gz.sha256
