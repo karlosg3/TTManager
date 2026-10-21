@@ -18,9 +18,9 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 
 use app::{App, CurrentView};
 
-/// System Monitor TUI - Monitor de recursos del sistema para Linux
+/// TTM (TuiTaskManager) - Monitor de recursos del sistema para Linux
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(name = "ttm", author, version, about, long_about = None)]
 struct Cli {
     /// Intervalo de muestreo en milisegundos (por defecto: 1000 ms)
     #[arg(short, long, default_value_t = 1000)]
