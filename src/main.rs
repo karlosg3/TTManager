@@ -1,4 +1,5 @@
 mod app;
+mod disk;
 mod gpu;
 mod net;
 mod ui;
@@ -25,8 +26,8 @@ struct Cli {
     #[arg(short, long, default_value_t = 1000)]
     interval: u64,
 
-    /// Vista inicial: overview, cpu, ram, gpu
-    #[arg(short, long, default_value = "overview")]
+    /// Vista inicial: home, cpu, ram, gpu, disk, procs, ports
+    #[arg(short, long, default_value = "home")]
     view: String,
 }
 
@@ -55,14 +56,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         "cpu" => app.set_view(CurrentView::Cpu),
         "ram" | "mem" => app.set_view(CurrentView::Ram),
         "gpu" => app.set_view(CurrentView::Gpu),
-        _ => app.set_view(CurrentView::Overview),
+        "disk" | "disco" | "storage" => app.set_view(CurrentView::Disk),
+        "procs" | "procesos" => app.set_view(CurrentView::Procs),
+        "ports" | "puertos" => app.set_view(CurrentView::Ports),
+        _ => app.set_view(CurrentView::Home),
     }
 
     let tick_rate = Duration::from_millis(args.interval.max(200));
     let mut last_tick = Instant::now();
 
     while !app.should_quit {
-        terminal.draw(|f| ui::draw(f, &mut app))?;
+        terminal.draw(|f| ui::draw(f, &app))?;
 
         let timeout = tick_rate
             .checked_sub(last_tick.elapsed())
@@ -94,16 +98,19 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
                 KeyCode::Char('?') | KeyCode::Char('h') => app.toggle_help(),
                 KeyCode::Char('c') | KeyCode::Char('C') => app.toggle_cpu_mode(),
-                KeyCode::Char('p') | KeyCode::Char('P') => app.toggle_overview_focus(),
+                KeyCode::Char('d') | KeyCode::Char('D') => app.toggle_expanded(),
                 KeyCode::Char('s') | KeyCode::Char('S') => app.toggle_process_sort(),
                 KeyCode::Tab => app.next_view(),
                 KeyCode::BackTab => app.prev_view(),
                 KeyCode::Right => app.next_view(),
                 KeyCode::Left => app.prev_view(),
-                KeyCode::Char('1') => app.set_view(CurrentView::Overview),
+                KeyCode::Char('1') => app.set_view(CurrentView::Home),
                 KeyCode::Char('2') => app.set_view(CurrentView::Cpu),
                 KeyCode::Char('3') => app.set_view(CurrentView::Ram),
                 KeyCode::Char('4') => app.set_view(CurrentView::Gpu),
+                KeyCode::Char('5') => app.set_view(CurrentView::Disk),
+                KeyCode::Char('6') => app.set_view(CurrentView::Procs),
+                KeyCode::Char('7') => app.set_view(CurrentView::Ports),
                 KeyCode::Up | KeyCode::Char('k') => app.scroll_up(),
                 KeyCode::Down | KeyCode::Char('j') => app.scroll_down(),
                 KeyCode::PageUp => app.page_up(),

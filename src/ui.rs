@@ -1,1259 +1,977 @@
+use std::collections::VecDeque;
+
 use ratatui::{
     Frame,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     symbols::Marker,
     text::{Line, Span},
     widgets::{
-        Axis, Block, BorderType, Borders, Cell, Chart, Clear, Dataset, Gauge, GraphType, Paragraph,
-        Row, Sparkline, Table, Tabs, Wrap,
+        Axis, Block, BorderType, Borders, Cell, Chart, Clear, Dataset, GraphType, Paragraph, Row,
+        Table, Wrap,
     },
 };
 
-use crate::app::{App, CpuMode, CurrentView, OverviewFocus};
+use crate::app::{App, CpuMode, CurrentView};
 
-pub fn draw(f: &mut Frame, app: &mut App) {
+const GIB: f64 = 1_073_741_824.0;
+const ACCENT: Color = Color::Cyan;
+const DIM: Color = Color::DarkGray;
+const SPARKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+// Tux; las dos últimas filas (patas) van en amarillo
+const LOGO: [&str; 7] = [
+    "      .--.",
+    "     |o_o |",
+    "     |:_/ |",
+    "    //   \\ \\",
+    "   (|     | )",
+    "  /'\\_   _/`\\",
+    "  \\___)=(___/",
+];
+const LOGO_WIDTH: u16 = 24;
+
+const LABEL_WIDTH: usize = 12;
+
+pub fn draw(f: &mut Frame, app: &App) {
     let size = f.area();
-
-    // Main layout: Header (top), Tab content (middle), Footer (bottom)
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(4), // Header + Info banner
-            Constraint::Length(3), // Navigation Tabs
-            Constraint::Min(10),   // Content
-            Constraint::Length(2), // Footer / Keybindings
-        ])
-        .split(size);
+    let chunks = Layout::vertical([
+        Constraint::Length(2), // Pestañas
+        Constraint::Min(0),    // Contenido
+        Constraint::Length(1), // Atajos
+    ])
+    .split(size);
 
     draw_header(f, app, chunks[0]);
-    draw_tabs(f, app, chunks[1]);
 
+    let body = chunks[1].inner(Margin::new(1, 1));
     match app.current_view {
-        CurrentView::Overview => draw_overview(f, app, chunks[2]),
-        CurrentView::Cpu => draw_cpu(f, app, chunks[2]),
-        CurrentView::Ram => draw_ram(f, app, chunks[2]),
-        CurrentView::Gpu => draw_gpu(f, app, chunks[2]),
+        CurrentView::Home => draw_home(f, app, body),
+        CurrentView::Cpu => draw_cpu(f, app, body),
+        CurrentView::Ram => draw_ram(f, app, body),
+        CurrentView::Gpu => draw_gpu(f, app, body),
+        CurrentView::Disk => draw_disk(f, app, body),
+        CurrentView::Procs => draw_procs(f, app, body),
+        CurrentView::Ports => draw_ports(f, app, body),
     }
 
-    draw_footer(f, app, chunks[3]);
+    draw_footer(f, app, chunks[2]);
 
     if app.show_help {
         draw_help_modal(f, size);
     }
 }
 
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn level_color(pct: u64) -> Color {
+    if pct >= 85 {
+        Color::Red
+    } else if pct >= 60 {
+        Color::Yellow
+    } else {
+        ACCENT
+    }
+}
+
+fn label(text: &str) -> Span<'static> {
+    Span::styled(
+        format!("{text:<LABEL_WIDTH$}"),
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+    )
+}
+
+fn kv(key: &str, value: impl Into<String>) -> Line<'static> {
+    Line::from(vec![label(key), Span::raw(value.into())])
+}
+
+fn dim(text: impl Into<String>) -> Span<'static> {
+    Span::styled(text.into(), Style::default().fg(DIM))
+}
+
+/// Barra delgada: tramo lleno con color por nivel, resto atenuado.
+fn bar(pct: u64, width: usize) -> Vec<Span<'static>> {
+    let filled = (pct.min(100) as usize * width + 50) / 100;
+    vec![
+        Span::styled("━".repeat(filled), Style::default().fg(level_color(pct))),
+        dim("━".repeat(width - filled)),
+    ]
+}
+
+fn metric(name: &str, pct: u64, detail: String, bar_width: usize) -> Line<'static> {
+    let mut spans = vec![label(name)];
+    spans.extend(bar(pct, bar_width));
+    spans.push(Span::raw(format!(" {pct:>3}%")));
+    if !detail.is_empty() {
+        spans.push(dim(format!("  {detail}")));
+    }
+    Line::from(spans)
+}
+
+/// Mini gráfica de texto con las últimas `width` muestras (0-100).
+fn spark_line(history: &VecDeque<u64>, width: usize) -> Line<'static> {
+    let skip = history.len().saturating_sub(width);
+    let text: String = history
+        .iter()
+        .skip(skip)
+        .map(|&v| SPARKS[((v.min(100) * 7 + 50) / 100) as usize])
+        .collect();
+    Line::from(vec![
+        Span::raw(" ".repeat(LABEL_WIDTH)),
+        Span::styled(text, Style::default().fg(ACCENT)),
+    ])
+}
+
+/// Tamaño legible: GB, o TB a partir de 1024 GB
+fn size(bytes: u64) -> String {
+    let gb = bytes as f64 / GIB;
+    if gb >= 1024.0 {
+        format!("{:.2} TB", gb / 1024.0)
+    } else {
+        format!("{gb:.1} GB")
+    }
+}
+
+fn last(history: &VecDeque<u64>) -> u64 {
+    *history.back().unwrap_or(&0)
+}
+
+fn pct_of(used: u64, total: u64) -> u64 {
+    if total == 0 {
+        0
+    } else {
+        (used as f64 / total as f64 * 100.0).round().min(100.0) as u64
+    }
+}
+
+fn series(history: &VecDeque<u64>) -> Vec<(f64, f64)> {
+    history
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| (i as f64, v as f64))
+        .collect()
+}
+
+fn history_chart<'a>(title: String, data: &'a [(f64, f64)], color: Color) -> Chart<'a> {
+    let dataset = Dataset::default()
+        .marker(Marker::Braille)
+        .graph_type(GraphType::Line)
+        .style(Style::default().fg(color))
+        .data(data);
+
+    let axis_style = Style::default().fg(DIM);
+    Chart::new(vec![dataset])
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(axis_style)
+                .title(Span::styled(
+                    title,
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                )),
+        )
+        .x_axis(
+            Axis::default()
+                .style(axis_style)
+                .bounds([0.0, 60.0])
+                .labels(["60s", "30s", "0s"]),
+        )
+        .y_axis(
+            Axis::default()
+                .style(axis_style)
+                .bounds([0.0, 100.0])
+                .labels(["0%", "50%", "100%"]),
+        )
+}
+
+fn render_columns(f: &mut Frame, area: Rect, columns: Vec<Vec<Line<'static>>>) {
+    let n = columns.len() as u32;
+    let areas = Layout::horizontal(vec![Constraint::Ratio(1, n); columns.len()]).split(area);
+    for (col, rect) in columns.into_iter().zip(areas.iter()) {
+        f.render_widget(Paragraph::new(col), *rect);
+    }
+}
+
+fn bar_width(area: Rect) -> usize {
+    // etiqueta + porcentaje + detalle (~18 columnas) deben caber junto a la barra
+    (area.width as usize)
+        .saturating_sub(LABEL_WIDTH + 5 + 18)
+        .clamp(8, 70)
+}
+
+fn hint(text: &str) -> Line<'static> {
+    Line::from(dim(text.to_string()))
+}
+
+// ---------------------------------------------------------------------------
+// Cabecera y pie
+// ---------------------------------------------------------------------------
+
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(Span::styled(
-            " 💻 System Monitor TUI (Task Manager) ",
+    let mut spans = vec![
+        Span::styled(
+            " ttm ",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(Color::Black)
+                .bg(ACCENT)
                 .add_modifier(Modifier::BOLD),
-        ));
-
-    let header_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(block.inner(area));
-
-    let left_info = vec![
-        Line::from(vec![
-            Span::styled("Dispositivo: ", Style::default().fg(Color::Yellow).bold()),
-            Span::raw(&app.system_info.host_name),
-            Span::raw(" | "),
-            Span::styled("SO: ", Style::default().fg(Color::Yellow).bold()),
-            Span::raw(&app.system_info.os_name),
-            Span::raw(" ("),
-            Span::raw(&app.system_info.kernel_version),
-            Span::raw(")"),
-        ]),
-        Line::from(vec![
-            Span::styled("Procesador:  ", Style::default().fg(Color::Cyan).bold()),
-            Span::raw(&app.system_info.cpu_model),
-            Span::raw(format!(" [{} hilos]", app.system_info.logical_cores)),
-        ]),
+        ),
+        Span::raw(" "),
     ];
-
-    let right_info = vec![
-        Line::from(vec![
-            Span::styled("Gráfica:  ", Style::default().fg(Color::Magenta).bold()),
-            Span::raw(&app.gpu_info().name),
-            Span::raw(format!(" ({})", app.gpu_info().driver)),
-        ]),
-        Line::from(vec![
-            Span::styled("Activo:   ", Style::default().fg(Color::Green).bold()),
-            Span::raw(app.uptime_formatted()),
-            Span::raw(" | "),
-            Span::styled("Procesos: ", Style::default().fg(Color::Green).bold()),
-            Span::raw(app.processes.len().to_string()),
-            Span::raw(" | "),
-            Span::styled("Puertos: ", Style::default().fg(Color::Green).bold()),
-            Span::raw(app.ports.len().to_string()),
-        ]),
-    ];
-
-    f.render_widget(block, area);
-    f.render_widget(Paragraph::new(left_info), header_chunks[0]);
-    f.render_widget(Paragraph::new(right_info), header_chunks[1]);
-}
-
-fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
-    let titles = vec!["[1] Resumen", "[2] CPU", "[3] Memoria (RAM)", "[4] GPU"];
-    let selected_idx = match app.current_view {
-        CurrentView::Overview => 0,
-        CurrentView::Cpu => 1,
-        CurrentView::Ram => 2,
-        CurrentView::Gpu => 3,
-    };
-
-    let tabs = Tabs::new(titles)
-        .block(
-            Block::default()
-                .borders(Borders::BOTTOM | Borders::LEFT | Borders::RIGHT)
-                .border_style(Style::default().fg(Color::DarkGray)),
-        )
-        .select(selected_idx)
-        .style(Style::default().fg(Color::Gray))
-        .highlight_style(
-            Style::default()
-                .fg(Color::White)
-                .bg(Color::Blue)
-                .add_modifier(Modifier::BOLD),
-        )
-        .divider(Span::raw(" │ "));
-
-    f.render_widget(tabs, area);
-}
-
-fn draw_overview(f: &mut Frame, app: &App, area: Rect) {
-    // Top: 4 resource summary cards
-    // Bottom: Split between active processes and listening ports
-    let main_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(8), Constraint::Min(8)])
-        .split(area);
-
-    let cards_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(25),
-            Constraint::Percentage(25),
-            Constraint::Percentage(25),
-            Constraint::Percentage(25),
-        ])
-        .split(main_chunks[0]);
-
-    // 1. CPU Card
-    let cpu_pct = *app.cpu_history.back().unwrap_or(&0);
-    let cpu_history_slice: Vec<u64> = app.cpu_history.iter().copied().collect();
-    let cpu_card = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(" CPU ");
-    let cpu_inner = cpu_card.inner(cards_chunks[0]);
-    f.render_widget(cpu_card, cards_chunks[0]);
-
-    let cpu_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2),
-            Constraint::Length(2),
-            Constraint::Min(1),
-        ])
-        .split(cpu_inner);
-
-    let cpu_gauge = Gauge::default()
-        .gauge_style(Style::default().fg(Color::Cyan))
-        .percent(cpu_pct.min(100) as u16)
-        .label(format!("{cpu_pct}%"));
-    f.render_widget(cpu_gauge, cpu_layout[0]);
-
-    let cpu_stats = Paragraph::new(format!(
-        "{} GHz • {} núcleos",
-        (app.system_info.frequency_mhz as f64) / 1000.0,
-        app.system_info.logical_cores
-    ))
-    .style(Style::default().fg(Color::DarkGray));
-    f.render_widget(cpu_stats, cpu_layout[1]);
-
-    let cpu_spark = Sparkline::default()
-        .data(&cpu_history_slice)
-        .style(Style::default().fg(Color::Cyan));
-    f.render_widget(cpu_spark, cpu_layout[2]);
-
-    // 2. RAM Card
-    let ram_used = app.sys.used_memory() as f64 / 1_073_741_824.0;
-    let ram_total = app.sys.total_memory() as f64 / 1_073_741_824.0;
-    let ram_pct = *app.ram_history.back().unwrap_or(&0);
-    let ram_history_slice: Vec<u64> = app.ram_history.iter().copied().collect();
-    let ram_card = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Green))
-        .title(" RAM ");
-    let ram_inner = ram_card.inner(cards_chunks[1]);
-    f.render_widget(ram_card, cards_chunks[1]);
-
-    let ram_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2),
-            Constraint::Length(2),
-            Constraint::Min(1),
-        ])
-        .split(ram_inner);
-
-    let ram_gauge = Gauge::default()
-        .gauge_style(Style::default().fg(Color::Green))
-        .percent(ram_pct.min(100) as u16)
-        .label(format!("{ram_pct}% ({ram_used:.1}/{ram_total:.1} GB)"));
-    f.render_widget(ram_gauge, ram_layout[0]);
-
-    let ram_stats = Paragraph::new(format!(
-        "Disp: {:.1} GB • Total: {:.1} GB",
-        (app.sys.available_memory() as f64 / 1_073_741_824.0),
-        ram_total
-    ))
-    .style(Style::default().fg(Color::DarkGray));
-    f.render_widget(ram_stats, ram_layout[1]);
-
-    let ram_spark = Sparkline::default()
-        .data(&ram_history_slice)
-        .style(Style::default().fg(Color::Green));
-    f.render_widget(ram_spark, ram_layout[2]);
-
-    // 3. SWAP Card
-    let swap_used = app.sys.used_swap() as f64 / 1_073_741_824.0;
-    let swap_total = app.sys.total_swap() as f64 / 1_073_741_824.0;
-    let swap_pct = *app.swap_history.back().unwrap_or(&0);
-    let swap_history_slice: Vec<u64> = app.swap_history.iter().copied().collect();
-    let swap_card = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Yellow))
-        .title(" SWAP ");
-    let swap_inner = swap_card.inner(cards_chunks[2]);
-    f.render_widget(swap_card, cards_chunks[2]);
-
-    let swap_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2),
-            Constraint::Length(2),
-            Constraint::Min(1),
-        ])
-        .split(swap_inner);
-
-    let swap_gauge = Gauge::default()
-        .gauge_style(Style::default().fg(Color::Yellow))
-        .percent(swap_pct.min(100) as u16)
-        .label(format!("{swap_pct}% ({swap_used:.1}/{swap_total:.1} GB)"));
-    f.render_widget(swap_gauge, swap_layout[0]);
-
-    let swap_stats = Paragraph::new(format!("Libre: {:.1} GB", swap_total - swap_used))
-        .style(Style::default().fg(Color::DarkGray));
-    f.render_widget(swap_stats, swap_layout[1]);
-
-    let swap_spark = Sparkline::default()
-        .data(&swap_history_slice)
-        .style(Style::default().fg(Color::Yellow));
-    f.render_widget(swap_spark, swap_layout[2]);
-
-    // 4. GPU Card
-    let gpu_info = app.gpu_info();
-    let gpu_pct = *app.gpu_history.back().unwrap_or(&0);
-    let gpu_history_slice: Vec<u64> = app.gpu_history.iter().copied().collect();
-    let gpu_card = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Magenta))
-        .title(" GPU ");
-    let gpu_inner = gpu_card.inner(cards_chunks[3]);
-    f.render_widget(gpu_card, cards_chunks[3]);
-
-    let gpu_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2),
-            Constraint::Length(2),
-            Constraint::Min(1),
-        ])
-        .split(gpu_inner);
-
-    let gpu_gauge = Gauge::default()
-        .gauge_style(Style::default().fg(Color::Magenta))
-        .percent(gpu_pct.min(100) as u16)
-        .label(if let Some(temp) = gpu_info.temperature {
-            format!("{gpu_pct}% • {temp:.0}°C")
+    for (i, view) in CurrentView::ALL.iter().enumerate() {
+        let text = format!(" {} {} ", i + 1, view.title());
+        spans.push(if *view == app.current_view {
+            Span::styled(
+                text,
+                Style::default()
+                    .fg(ACCENT)
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            )
         } else {
-            format!("{gpu_pct}%")
+            dim(text)
         });
-    f.render_widget(gpu_gauge, gpu_layout[0]);
+    }
 
-    let vram_label = if let (Some(used), Some(tot)) = (gpu_info.vram_used, gpu_info.vram_total) {
-        format!(
-            "VRAM: {:.1}/{:.1} GB",
-            used as f64 / 1_073_741_824.0,
-            tot as f64 / 1_073_741_824.0
-        )
-    } else {
-        format!("Driver: {}", gpu_info.driver)
-    };
-    let gpu_stats = Paragraph::new(vram_label).style(Style::default().fg(Color::DarkGray));
-    f.render_widget(gpu_stats, gpu_layout[1]);
-
-    let gpu_spark = Sparkline::default()
-        .data(&gpu_history_slice)
-        .style(Style::default().fg(Color::Magenta));
-    f.render_widget(gpu_spark, gpu_layout[2]);
-
-    // Tables split (Processes & Ports)
-    let table_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-        .split(main_chunks[1]);
-
-    draw_processes_table(f, app, table_chunks[0]);
-    draw_ports_table(f, app, table_chunks[1]);
-}
-
-fn draw_processes_table(f: &mut Frame, app: &App, area: Rect) {
-    let is_focused = app.overview_focus == OverviewFocus::Processes;
-    let border_color = if is_focused {
-        Color::Cyan
-    } else {
-        Color::DarkGray
-    };
-
-    let title = format!(
-        " Procesos Activos ({}) [s: {}] [Foco: Tab/p] ",
-        app.processes.len(),
-        app.process_sort.label()
+    let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(area);
+    f.render_widget(Paragraph::new(Line::from(spans)), rows[0]);
+    f.render_widget(
+        Paragraph::new("─".repeat(area.width as usize)).style(Style::default().fg(DIM)),
+        rows[1],
     );
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(border_color))
-        .title(Span::styled(
-            title,
-            if is_focused {
-                Style::default().fg(Color::Cyan).bold()
-            } else {
-                Style::default().fg(Color::Gray)
-            },
-        ));
-
-    let header_cells = ["PID", "Nombre", "CPU %", "Memoria", "Estado"]
-        .iter()
-        .map(|h| {
-            Cell::from(*h).style(
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )
-        });
-    let header = Row::new(header_cells).height(1).bottom_margin(1);
-
-    let rows_count = area.height.saturating_sub(4) as usize;
-    let start_idx = if app.process_table_state >= rows_count {
-        app.process_table_state - rows_count + 1
-    } else {
-        0
-    };
-    let end_idx = (start_idx + rows_count).min(app.processes.len());
-
-    let rows = app.processes[start_idx..end_idx]
-        .iter()
-        .enumerate()
-        .map(|(rel_idx, p)| {
-            let actual_idx = start_idx + rel_idx;
-            let is_selected = is_focused && actual_idx == app.process_table_state;
-
-            let mem_mb = p.memory_bytes as f64 / 1_048_576.0;
-            let mem_str = if mem_mb > 1024.0 {
-                format!("{:.2} GB ({:.1}%)", mem_mb / 1024.0, p.memory_percent)
-            } else {
-                format!("{mem_mb:.1} MB ({:.1}%)", p.memory_percent)
-            };
-
-            let row_style = if is_selected {
-                Style::default()
-                    .bg(Color::Blue)
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD)
-            } else if actual_idx % 2 == 0 {
-                Style::default().fg(Color::White)
-            } else {
-                Style::default().fg(Color::Gray)
-            };
-
-            Row::new(vec![
-                Cell::from(p.pid.to_string()),
-                Cell::from(p.name.clone()),
-                Cell::from(format!("{:.1}%", p.cpu_usage)),
-                Cell::from(mem_str),
-                Cell::from(p.status.clone()),
-            ])
-            .style(row_style)
-        });
-
-    let widths = [
-        Constraint::Length(8),
-        Constraint::Percentage(40),
-        Constraint::Length(10),
-        Constraint::Length(12),
-        Constraint::Length(10),
-    ];
-
-    let table = Table::new(rows, widths).header(header).block(block);
-
-    f.render_widget(table, area);
-}
-
-fn draw_ports_table(f: &mut Frame, app: &App, area: Rect) {
-    let is_focused = app.overview_focus == OverviewFocus::Ports;
-    let border_color = if is_focused {
-        Color::Cyan
-    } else {
-        Color::DarkGray
-    };
-
-    let title = format!(" Puertos en Escucha ({}) ", app.ports.len());
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(border_color))
-        .title(Span::styled(
-            title,
-            if is_focused {
-                Style::default().fg(Color::Cyan).bold()
-            } else {
-                Style::default().fg(Color::Gray)
-            },
-        ));
-
-    let header_cells = ["Puerto", "Proto", "Dirección", "PID", "Proceso"]
-        .iter()
-        .map(|h| {
-            Cell::from(*h).style(
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )
-        });
-    let header = Row::new(header_cells).height(1).bottom_margin(1);
-
-    let rows_count = area.height.saturating_sub(4) as usize;
-    let start_idx = if app.port_table_state >= rows_count {
-        app.port_table_state - rows_count + 1
-    } else {
-        0
-    };
-    let end_idx = (start_idx + rows_count).min(app.ports.len());
-
-    let rows = app.ports[start_idx..end_idx]
-        .iter()
-        .enumerate()
-        .map(|(rel_idx, p)| {
-            let actual_idx = start_idx + rel_idx;
-            let is_selected = is_focused && actual_idx == app.port_table_state;
-
-            let pid_str = p
-                .pid
-                .map(|pid| pid.to_string())
-                .unwrap_or_else(|| "-".to_string());
-            let name_str = p.process_name.clone().unwrap_or_else(|| "-".to_string());
-
-            let row_style = if is_selected {
-                Style::default()
-                    .bg(Color::Blue)
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD)
-            } else if actual_idx % 2 == 0 {
-                Style::default().fg(Color::White)
-            } else {
-                Style::default().fg(Color::Gray)
-            };
-
-            Row::new(vec![
-                Cell::from(p.port.to_string()),
-                Cell::from(p.protocol),
-                Cell::from(p.address.clone()),
-                Cell::from(pid_str),
-                Cell::from(name_str),
-            ])
-            .style(row_style)
-        });
-
-    let widths = [
-        Constraint::Length(8),
-        Constraint::Length(7),
-        Constraint::Percentage(32),
-        Constraint::Length(8),
-        Constraint::Percentage(35),
-    ];
-
-    let table = Table::new(rows, widths).header(header).block(block);
-
-    f.render_widget(table, area);
-}
-
-fn draw_cpu(f: &mut Frame, app: &App, area: Rect) {
-    let mode_title = match app.cpu_mode {
-        CpuMode::Global => "Modo Global (Atajo: [c] para Por Núcleo)",
-        CpuMode::PerCore => "Modo Por Núcleo (Atajo: [c] para Global)",
-    };
-
-    let main_block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(Span::styled(
-            format!(" CPU: {} • {} ", app.system_info.cpu_model, mode_title),
-            Style::default().fg(Color::Cyan).bold(),
-        ));
-
-    let inner = main_block.inner(area);
-    f.render_widget(main_block, area);
-
-    match app.cpu_mode {
-        CpuMode::Global => draw_cpu_global(f, app, inner),
-        CpuMode::PerCore => draw_cpu_per_core(f, app, inner),
-    }
-}
-
-fn draw_cpu_global(f: &mut Frame, app: &App, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(8), Constraint::Length(7)])
-        .split(area);
-
-    // High precision Windows Task Manager style Chart
-    let data: Vec<(f64, f64)> = app
-        .cpu_history
-        .iter()
-        .enumerate()
-        .map(|(i, &val)| (i as f64, val as f64))
-        .collect();
-
-    let dataset = Dataset::default()
-        .name("Uso de CPU (%)")
-        .marker(Marker::Braille)
-        .graph_type(GraphType::Line)
-        .style(Style::default().fg(Color::Cyan).bold())
-        .data(&data);
-
-    let current_val = *app.cpu_history.back().unwrap_or(&0);
-    let x_labels = vec![
-        Span::raw("60s"),
-        Span::raw("45s"),
-        Span::raw("30s"),
-        Span::raw("15s"),
-        Span::raw("0s (actual)"),
-    ];
-
-    let y_labels = vec![
-        Span::raw("0%"),
-        Span::raw("25%"),
-        Span::raw("50%"),
-        Span::raw("75%"),
-        Span::raw("100%"),
-    ];
-
-    let chart = Chart::new(vec![dataset])
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Plain)
-                .border_style(Style::default().fg(Color::DarkGray))
-                .title(Span::styled(
-                    format!(" Historial de uso continuo (%): {current_val}% actual "),
-                    Style::default().fg(Color::Cyan).bold(),
-                )),
-        )
-        .x_axis(
-            Axis::default()
-                .title("Tiempo")
-                .style(Style::default().fg(Color::DarkGray))
-                .bounds([0.0, 60.0])
-                .labels(x_labels),
-        )
-        .y_axis(
-            Axis::default()
-                .title("%")
-                .style(Style::default().fg(Color::DarkGray))
-                .bounds([0.0, 100.0])
-                .labels(y_labels),
-        );
-
-    f.render_widget(chart, chunks[0]);
-
-    // Bottom CPU stats panel (Windows Task Manager style)
-    let stats_block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(" Detalles del Procesador ");
-
-    let stats_inner = stats_block.inner(chunks[1]);
-    f.render_widget(stats_block, chunks[1]);
-
-    let stat_cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(25),
-            Constraint::Percentage(25),
-            Constraint::Percentage(25),
-            Constraint::Percentage(25),
-        ])
-        .split(stats_inner);
-
-    let col1 = vec![
-        Line::from(vec![
-            Span::styled("Utilización: ", Style::default().fg(Color::Yellow).bold()),
-            Span::styled(
-                format!("{current_val}%"),
-                Style::default().fg(Color::Cyan).bold(),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("Velocidad:   ", Style::default().fg(Color::Yellow).bold()),
-            Span::raw(format!(
-                "{:.2} GHz",
-                (app.system_info.frequency_mhz as f64) / 1000.0
-            )),
-        ]),
-    ];
-
-    let col2 = vec![
-        Line::from(vec![
-            Span::styled(
-                "Núcleos Físicos: ",
-                Style::default().fg(Color::Yellow).bold(),
-            ),
-            Span::raw(app.system_info.physical_cores.to_string()),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "Hilos / Lógicos: ",
-                Style::default().fg(Color::Yellow).bold(),
-            ),
-            Span::raw(app.system_info.logical_cores.to_string()),
-        ]),
-    ];
-
-    let col3 = vec![
-        Line::from(vec![
-            Span::styled("Arquitectura: ", Style::default().fg(Color::Yellow).bold()),
-            Span::raw(&app.system_info.cpu_arch),
-        ]),
-        Line::from(vec![
-            Span::styled("Procesos:     ", Style::default().fg(Color::Yellow).bold()),
-            Span::raw(app.processes.len().to_string()),
-        ]),
-    ];
-
-    let col4 = vec![
-        Line::from(vec![
-            Span::styled("Tiempo Activo: ", Style::default().fg(Color::Yellow).bold()),
-            Span::raw(app.uptime_formatted()),
-        ]),
-        Line::from(vec![
-            Span::styled("Modo de Vista: ", Style::default().fg(Color::Yellow).bold()),
-            Span::styled("[c] PerCore", Style::default().fg(Color::Green)),
-        ]),
-    ];
-
-    f.render_widget(Paragraph::new(col1), stat_cols[0]);
-    f.render_widget(Paragraph::new(col2), stat_cols[1]);
-    f.render_widget(Paragraph::new(col3), stat_cols[2]);
-    f.render_widget(Paragraph::new(col4), stat_cols[3]);
-}
-
-fn draw_cpu_per_core(f: &mut Frame, app: &App, area: Rect) {
-    let cores = app.sys.cpus();
-    if cores.is_empty() {
-        return;
-    }
-
-    // Determine grid layout: 4 columns or 2 columns based on core count
-    let cols_count = if cores.len() > 8 { 4 } else { 2 };
-    let rows_count = cores.len().div_ceil(cols_count);
-
-    let row_constraints = vec![Constraint::Ratio(1, rows_count as u32); rows_count];
-    let row_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(row_constraints)
-        .split(area);
-
-    for (idx, cpu) in cores.iter().enumerate() {
-        let r = idx / cols_count;
-        let c = idx % cols_count;
-
-        let col_constraints = vec![Constraint::Ratio(1, cols_count as u32); cols_count];
-        let col_chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints(col_constraints)
-            .split(row_chunks[r]);
-
-        let core_area = col_chunks[c];
-        let usage = cpu.cpu_usage().round().min(100.0) as u16;
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Plain)
-            .border_style(Style::default().fg(Color::DarkGray))
-            .title(format!(" Núcleo #{} ", idx));
-        let inner = block.inner(core_area);
-        f.render_widget(block, core_area);
-
-        let inner_layout = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Min(1)])
-            .split(inner);
-
-        let gauge_color = if usage > 85 {
-            Color::Red
-        } else if usage > 50 {
-            Color::Yellow
-        } else {
-            Color::Cyan
-        };
-
-        let gauge = Gauge::default()
-            .gauge_style(Style::default().fg(gauge_color))
-            .percent(usage)
-            .label(format!("{usage}%"));
-        f.render_widget(gauge, inner_layout[0]);
-
-        if idx < app.per_core_history.len() && inner_layout[1].height > 0 {
-            let hist: Vec<u64> = app.per_core_history[idx].iter().copied().collect();
-            let spark = Sparkline::default()
-                .data(&hist)
-                .style(Style::default().fg(gauge_color));
-            f.render_widget(spark, inner_layout[1]);
-        }
-    }
-}
-
-fn draw_ram(f: &mut Frame, app: &App, area: Rect) {
-    let main_block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Green))
-        .title(Span::styled(
-            " Memoria Física (RAM) y Archivo de Paginación (SWAP) ",
-            Style::default().fg(Color::Green).bold(),
-        ));
-
-    let inner = main_block.inner(area);
-    f.render_widget(main_block, area);
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(8), Constraint::Length(8)])
-        .split(inner);
-
-    // Split top into 2 charts: RAM chart and Swap chart
-    let chart_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(chunks[0]);
-
-    // RAM Chart
-    let ram_data: Vec<(f64, f64)> = app
-        .ram_history
-        .iter()
-        .enumerate()
-        .map(|(i, &val)| (i as f64, val as f64))
-        .collect();
-
-    let ram_dataset = Dataset::default()
-        .name("RAM (%)")
-        .marker(Marker::Braille)
-        .graph_type(GraphType::Line)
-        .style(Style::default().fg(Color::Green).bold())
-        .data(&ram_data);
-
-    let ram_pct = *app.ram_history.back().unwrap_or(&0);
-    let ram_used_gb = app.sys.used_memory() as f64 / 1_073_741_824.0;
-    let ram_total_gb = app.sys.total_memory() as f64 / 1_073_741_824.0;
-
-    let x_labels = vec![Span::raw("60s"), Span::raw("30s"), Span::raw("0s")];
-
-    let y_labels = vec![Span::raw("0%"), Span::raw("50%"), Span::raw("100%")];
-
-    let ram_chart = Chart::new(vec![ram_dataset])
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Plain)
-                .border_style(Style::default().fg(Color::DarkGray))
-                .title(Span::styled(
-                    format!(" Historial de Memoria Física: {ram_used_gb:.2} / {ram_total_gb:.2} GB ({ram_pct}%) "),
-                    Style::default().fg(Color::Green).bold(),
-                )),
-        )
-        .x_axis(
-            Axis::default()
-                .title("Tiempo")
-                .style(Style::default().fg(Color::DarkGray))
-                .bounds([0.0, 60.0])
-                .labels(x_labels.clone()),
-        )
-        .y_axis(
-            Axis::default()
-                .title("%")
-                .style(Style::default().fg(Color::DarkGray))
-                .bounds([0.0, 100.0])
-                .labels(y_labels.clone()),
-        );
-
-    f.render_widget(ram_chart, chart_chunks[0]);
-
-    // Swap Chart
-    let swap_data: Vec<(f64, f64)> = app
-        .swap_history
-        .iter()
-        .enumerate()
-        .map(|(i, &val)| (i as f64, val as f64))
-        .collect();
-
-    let swap_dataset = Dataset::default()
-        .name("SWAP (%)")
-        .marker(Marker::Braille)
-        .graph_type(GraphType::Line)
-        .style(Style::default().fg(Color::Yellow).bold())
-        .data(&swap_data);
-
-    let swap_pct = *app.swap_history.back().unwrap_or(&0);
-    let swap_used_gb = app.sys.used_swap() as f64 / 1_073_741_824.0;
-    let swap_total_gb = app.sys.total_swap() as f64 / 1_073_741_824.0;
-
-    let swap_chart = Chart::new(vec![swap_dataset])
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Plain)
-                .border_style(Style::default().fg(Color::DarkGray))
-                .title(Span::styled(
-                    format!(" Historial de Swap: {swap_used_gb:.2} / {swap_total_gb:.2} GB ({swap_pct}%) "),
-                    Style::default().fg(Color::Yellow).bold(),
-                )),
-        )
-        .x_axis(
-            Axis::default()
-                .title("Tiempo")
-                .style(Style::default().fg(Color::DarkGray))
-                .bounds([0.0, 60.0])
-                .labels(x_labels),
-        )
-        .y_axis(
-            Axis::default()
-                .title("%")
-                .style(Style::default().fg(Color::DarkGray))
-                .bounds([0.0, 100.0])
-                .labels(y_labels),
-        );
-
-    f.render_widget(swap_chart, chart_chunks[1]);
-
-    // Memory Breakdown Panel
-    let details_block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Green))
-        .title(" Desglose de Memoria y Paginación ");
-
-    let details_inner = details_block.inner(chunks[1]);
-    f.render_widget(details_block, chunks[1]);
-
-    let detail_cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(33),
-            Constraint::Percentage(33),
-            Constraint::Percentage(34),
-        ])
-        .split(details_inner);
-
-    let free_ram_gb = app.sys.free_memory() as f64 / 1_073_741_824.0;
-    let avail_ram_gb = app.sys.available_memory() as f64 / 1_073_741_824.0;
-
-    let ram_col1 = vec![
-        Line::from(vec![
-            Span::styled(
-                "RAM Total:       ",
-                Style::default().fg(Color::Yellow).bold(),
-            ),
-            Span::raw(format!("{ram_total_gb:.2} GB")),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "En Uso:          ",
-                Style::default().fg(Color::Yellow).bold(),
-            ),
-            Span::styled(
-                format!("{ram_used_gb:.2} GB ({ram_pct}%)"),
-                Style::default().fg(Color::Green).bold(),
-            ),
-        ]),
-    ];
-
-    let ram_col2 = vec![
-        Line::from(vec![
-            Span::styled(
-                "Disponible:      ",
-                Style::default().fg(Color::Yellow).bold(),
-            ),
-            Span::raw(format!("{avail_ram_gb:.2} GB")),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "Libre:           ",
-                Style::default().fg(Color::Yellow).bold(),
-            ),
-            Span::raw(format!("{free_ram_gb:.2} GB")),
-        ]),
-    ];
-
-    let free_swap_gb = swap_total_gb - swap_used_gb;
-    let ram_col3 = vec![
-        Line::from(vec![
-            Span::styled(
-                "SWAP Total:      ",
-                Style::default().fg(Color::Yellow).bold(),
-            ),
-            Span::raw(format!("{swap_total_gb:.2} GB")),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "SWAP Usado:      ",
-                Style::default().fg(Color::Yellow).bold(),
-            ),
-            Span::styled(
-                format!("{swap_used_gb:.2} GB ({swap_pct}%)"),
-                Style::default().fg(Color::Yellow).bold(),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "SWAP Libre:      ",
-                Style::default().fg(Color::Yellow).bold(),
-            ),
-            Span::raw(format!("{free_swap_gb:.2} GB")),
-        ]),
-    ];
-
-    f.render_widget(Paragraph::new(ram_col1), detail_cols[0]);
-    f.render_widget(Paragraph::new(ram_col2), detail_cols[1]);
-    f.render_widget(Paragraph::new(ram_col3), detail_cols[2]);
-}
-
-fn draw_gpu(f: &mut Frame, app: &App, area: Rect) {
-    let gpu_info = app.gpu_info();
-
-    let main_block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Magenta))
-        .title(Span::styled(
-            format!(" GPU: {} ({}) ", gpu_info.name, gpu_info.driver),
-            Style::default().fg(Color::Magenta).bold(),
-        ));
-
-    let inner = main_block.inner(area);
-    f.render_widget(main_block, area);
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(8), Constraint::Length(9)])
-        .split(inner);
-
-    // GPU Compute Utilization Chart
-    let data: Vec<(f64, f64)> = app
-        .gpu_history
-        .iter()
-        .enumerate()
-        .map(|(i, &val)| (i as f64, val as f64))
-        .collect();
-
-    let dataset = Dataset::default()
-        .name("Cómputo GPU (%)")
-        .marker(Marker::Braille)
-        .graph_type(GraphType::Line)
-        .style(Style::default().fg(Color::Magenta).bold())
-        .data(&data);
-
-    let current_gpu = *app.gpu_history.back().unwrap_or(&0);
-    let x_labels = vec![
-        Span::raw("60s"),
-        Span::raw("45s"),
-        Span::raw("30s"),
-        Span::raw("15s"),
-        Span::raw("0s (actual)"),
-    ];
-
-    let y_labels = vec![
-        Span::raw("0%"),
-        Span::raw("25%"),
-        Span::raw("50%"),
-        Span::raw("75%"),
-        Span::raw("100%"),
-    ];
-
-    let chart = Chart::new(vec![dataset])
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Plain)
-                .border_style(Style::default().fg(Color::DarkGray))
-                .title(Span::styled(
-                    format!(" Historial de Cómputo GPU en Tiempo Real: {current_gpu}% actual "),
-                    Style::default().fg(Color::Magenta).bold(),
-                )),
-        )
-        .x_axis(
-            Axis::default()
-                .title("Tiempo")
-                .style(Style::default().fg(Color::DarkGray))
-                .bounds([0.0, 60.0])
-                .labels(x_labels),
-        )
-        .y_axis(
-            Axis::default()
-                .title("%")
-                .style(Style::default().fg(Color::DarkGray))
-                .bounds([0.0, 100.0])
-                .labels(y_labels),
-        );
-
-    f.render_widget(chart, chunks[0]);
-
-    // Bottom GPU Details Panel
-    let details_block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Magenta))
-        .title(" Memoria de Video (VRAM) y Sensores ");
-
-    let details_inner = details_block.inner(chunks[1]);
-    f.render_widget(details_block, chunks[1]);
-
-    let detail_cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(33),
-            Constraint::Percentage(33),
-            Constraint::Percentage(34),
-        ])
-        .split(details_inner);
-
-    let vram_used_gb = gpu_info.vram_used.map(|v| v as f64 / 1_073_741_824.0);
-    let vram_total_gb = gpu_info.vram_total.map(|v| v as f64 / 1_073_741_824.0);
-    let vram_pct = if let (Some(u), Some(t)) = (vram_used_gb, vram_total_gb) {
-        if t > 0.0 {
-            (u / t * 100.0).round() as u16
-        } else {
-            0
-        }
-    } else {
-        0
-    };
-
-    let col1_lines = vec![
-        Line::from(vec![
-            Span::styled("Dispositivo:  ", Style::default().fg(Color::Yellow).bold()),
-            Span::raw(&gpu_info.name),
-        ]),
-        Line::from(vec![
-            Span::styled("Controlador:  ", Style::default().fg(Color::Yellow).bold()),
-            Span::raw(&gpu_info.driver),
-        ]),
-        Line::from(vec![
-            Span::styled("Temperatura:  ", Style::default().fg(Color::Yellow).bold()),
-            if let Some(t) = gpu_info.temperature {
-                Span::styled(format!("{t:.1} °C"), Style::default().fg(Color::Red).bold())
-            } else {
-                Span::raw("N/D")
-            },
-        ]),
-    ];
-
-    let col2_lines = vec![
-        Line::from(vec![
-            Span::styled("VRAM Total:   ", Style::default().fg(Color::Yellow).bold()),
-            if let Some(tot) = vram_total_gb {
-                Span::raw(format!("{tot:.2} GB"))
-            } else {
-                Span::raw("Memoria Compartida")
-            },
-        ]),
-        Line::from(vec![
-            Span::styled("VRAM Usada:   ", Style::default().fg(Color::Yellow).bold()),
-            if let Some(used) = vram_used_gb {
-                Span::styled(
-                    format!("{used:.2} GB ({vram_pct}%)"),
-                    Style::default().fg(Color::Magenta).bold(),
-                )
-            } else {
-                Span::raw("N/D")
-            },
-        ]),
-    ];
-
-    let gtt_used_gb = gpu_info.gtt_used.map(|v| v as f64 / 1_073_741_824.0);
-    let gtt_total_gb = gpu_info.gtt_total.map(|v| v as f64 / 1_073_741_824.0);
-
-    let col3_lines = vec![
-        Line::from(vec![
-            Span::styled(
-                "GTT / Dinámica: ",
-                Style::default().fg(Color::Yellow).bold(),
-            ),
-            if let (Some(u), Some(t)) = (gtt_used_gb, gtt_total_gb) {
-                Span::raw(format!("{u:.2} / {t:.2} GB"))
-            } else {
-                Span::raw("N/D")
-            },
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "Uso de Motor:   ",
-                Style::default().fg(Color::Yellow).bold(),
-            ),
-            Span::styled(
-                format!("{current_gpu}%"),
-                Style::default().fg(Color::Magenta).bold(),
-            ),
-        ]),
-    ];
-
-    f.render_widget(Paragraph::new(col1_lines), detail_cols[0]);
-    f.render_widget(Paragraph::new(col2_lines), detail_cols[1]);
-    f.render_widget(Paragraph::new(col3_lines), detail_cols[2]);
 }
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
-    let focus_hint = if app.current_view == CurrentView::Overview {
-        "[p] Cambiar foco Proc/Puertos │ [s] Ordenar │ "
-    } else if app.current_view == CurrentView::Cpu {
-        "[c] Global / Por Núcleo │ "
-    } else {
-        ""
-    };
+    let mut hints = vec![
+        "1-7 pestañas".to_string(),
+        "←/→ navegar".to_string(),
+        format!("d detalle [{}]", if app.expanded { "on" } else { "off" }),
+    ];
+    match app.current_view {
+        CurrentView::Cpu => hints.push("c núcleos".to_string()),
+        CurrentView::Procs => {
+            hints.push("s orden".to_string());
+            hints.push("↑/↓ mover".to_string());
+        }
+        CurrentView::Ports => hints.push("↑/↓ mover".to_string()),
+        _ => {}
+    }
+    hints.push("? ayuda".to_string());
+    hints.push("q salir".to_string());
 
-    let text = format!(
-        " [1-4] Pestañas │ [Tab/←/→] Navegar │ {focus_hint}[↑/↓] Desplazar │ [?] Ayuda │ [q] Salir"
+    f.render_widget(
+        Paragraph::new(hints.join(" · "))
+            .style(Style::default().fg(DIM))
+            .alignment(Alignment::Center),
+        area,
     );
-
-    let footer = Paragraph::new(text)
-        .style(Style::default().fg(Color::White).bg(Color::DarkGray))
-        .alignment(Alignment::Center);
-
-    f.render_widget(footer, area);
 }
 
-fn draw_help_modal(f: &mut Frame, area: Rect) {
-    let modal_width = 62.min(area.width.saturating_sub(4));
-    let modal_height = 18.min(area.height.saturating_sub(4));
+// ---------------------------------------------------------------------------
+// Inicio (estilo neofetch)
+// ---------------------------------------------------------------------------
 
-    let x = (area.width.saturating_sub(modal_width)) / 2;
-    let y = (area.height.saturating_sub(modal_height)) / 2;
-    let modal_area = Rect::new(x, y, modal_width, modal_height);
+fn draw_home(f: &mut Frame, app: &App, area: Rect) {
+    let show_logo = area.width >= 64;
+    let cols = Layout::horizontal([
+        Constraint::Length(if show_logo { LOGO_WIDTH } else { 0 }),
+        Constraint::Min(0),
+    ])
+    .split(area);
 
-    f.render_widget(Clear, modal_area);
+    if show_logo {
+        let logo: Vec<Line> = LOGO
+            .iter()
+            .enumerate()
+            .map(|(i, row)| {
+                let color = if i >= 5 { Color::Yellow } else { ACCENT };
+                Line::from(Span::styled(*row, Style::default().fg(color)))
+            })
+            .collect();
+        f.render_widget(Paragraph::new(logo), cols[0]);
+    }
 
-    let help_text = vec![
-        Line::from(vec![Span::styled(
-            "Atajos de Teclado y Ayuda",
-            Style::default().fg(Color::Cyan).bold(),
-        )]),
+    f.render_widget(Paragraph::new(home_lines(app, cols[1])), cols[1]);
+}
+
+fn home_lines(app: &App, area: Rect) -> Vec<Line<'static>> {
+    let info = &app.system_info;
+    let gpu = app.gpu_info();
+    let bw = bar_width(area);
+    let spark_w = (area.width as usize).saturating_sub(LABEL_WIDTH).min(60);
+
+    let title = format!("{} · ttm", info.host_name);
+    let mut lines = vec![
+        Line::from(Span::styled(
+            title.clone(),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(dim("─".repeat(title.chars().count()))),
+        kv("SO", format!("{} ({})", info.os_name, info.kernel_version)),
+        kv("Activo", app.uptime_formatted()),
+        kv(
+            "CPU",
+            format!("{} [{} hilos]", info.cpu_model, info.logical_cores),
+        ),
+        kv("GPU", format!("{} ({})", gpu.name, gpu.driver)),
         Line::from(""),
+    ];
+
+    let ram_used = app.sys.used_memory();
+    let ram_total = app.sys.total_memory();
+    let swap_used = app.sys.used_swap();
+    let swap_total = app.sys.total_swap();
+
+    lines.push(metric(
+        "CPU",
+        last(&app.cpu_history),
+        format!("{:.1} GHz", info.frequency_mhz as f64 / 1000.0),
+        bw,
+    ));
+    if app.expanded {
+        lines.push(spark_line(&app.cpu_history, spark_w));
+    }
+
+    lines.push(metric(
+        "RAM",
+        last(&app.ram_history),
+        format!(
+            "{:.1}/{:.1} GB",
+            ram_used as f64 / GIB,
+            ram_total as f64 / GIB
+        ),
+        bw,
+    ));
+    if app.expanded {
+        lines.push(spark_line(&app.ram_history, spark_w));
+    }
+
+    lines.push(metric(
+        "SWAP",
+        last(&app.swap_history),
+        if swap_total == 0 {
+            "sin swap".to_string()
+        } else {
+            format!(
+                "{:.1}/{:.1} GB",
+                swap_used as f64 / GIB,
+                swap_total as f64 / GIB
+            )
+        },
+        bw,
+    ));
+    if app.expanded {
+        lines.push(spark_line(&app.swap_history, spark_w));
+    }
+
+    lines.push(metric(
+        "GPU",
+        last(&app.gpu_history),
+        gpu.temperature
+            .map(|t| format!("{t:.0} °C"))
+            .unwrap_or_default(),
+        bw,
+    ));
+    if app.expanded {
+        lines.push(spark_line(&app.gpu_history, spark_w));
+    }
+
+    if let Some(disk) = app.primary_disk() {
+        lines.push(metric(
+            "DISCO",
+            disk.used_percent(),
+            format!("{}/{}", size(disk.used()), size(disk.total)),
+            bw,
+        ));
+    }
+
+    if app.expanded {
+        lines.push(Line::from(""));
+        lines.push(kv(
+            "Núcleos",
+            format!(
+                "{} físicos · {} lógicos",
+                info.physical_cores, info.logical_cores
+            ),
+        ));
+        lines.push(kv("Arq.", info.cpu_arch.clone()));
+        if let (Some(u), Some(t)) = (gpu.vram_used, gpu.vram_total) {
+            lines.push(kv(
+                "VRAM",
+                format!("{:.1}/{:.1} GB", u as f64 / GIB, t as f64 / GIB),
+            ));
+        }
+        lines.push(kv(
+            "Procesos",
+            format!(
+                "{}  ·  puertos en escucha: {}",
+                app.processes.len(),
+                app.ports.len()
+            ),
+        ));
+    } else {
+        lines.push(Line::from(""));
+        lines.push(hint("d para ver gráficas y más detalle"));
+    }
+
+    lines
+}
+
+// ---------------------------------------------------------------------------
+// CPU
+// ---------------------------------------------------------------------------
+
+fn draw_cpu(f: &mut Frame, app: &App, area: Rect) {
+    if !app.expanded {
+        f.render_widget(Paragraph::new(cpu_summary(app, area)), area);
+        return;
+    }
+    match app.cpu_mode {
+        CpuMode::Global => draw_cpu_global(f, app, area),
+        CpuMode::PerCore => draw_cpu_per_core(f, app, area),
+    }
+}
+
+fn cpu_summary(app: &App, area: Rect) -> Vec<Line<'static>> {
+    let info = &app.system_info;
+    let spark_w = (area.width as usize).saturating_sub(LABEL_WIDTH).min(60);
+    vec![
+        kv("Modelo", info.cpu_model.clone()),
+        kv(
+            "Núcleos",
+            format!(
+                "{} físicos · {} hilos",
+                info.physical_cores, info.logical_cores
+            ),
+        ),
+        Line::from(""),
+        metric(
+            "Uso",
+            last(&app.cpu_history),
+            format!("{:.2} GHz", info.frequency_mhz as f64 / 1000.0),
+            bar_width(area),
+        ),
+        spark_line(&app.cpu_history, spark_w),
+        Line::from(""),
+        hint("d gráfica y detalle · c por núcleo"),
+    ]
+}
+
+fn draw_cpu_global(f: &mut Frame, app: &App, area: Rect) {
+    let chunks = Layout::vertical([Constraint::Min(6), Constraint::Length(4)]).split(area);
+    let current = last(&app.cpu_history);
+    let data = series(&app.cpu_history);
+    f.render_widget(
+        history_chart(format!(" CPU {current}% "), &data, ACCENT),
+        chunks[0],
+    );
+
+    let info = &app.system_info;
+    render_columns(
+        f,
+        chunks[1].inner(Margin::new(1, 0)),
+        vec![
+            vec![
+                kv("Uso", format!("{current}%")),
+                kv(
+                    "Velocidad",
+                    format!("{:.2} GHz", info.frequency_mhz as f64 / 1000.0),
+                ),
+                kv("Activo", app.uptime_formatted()),
+            ],
+            vec![
+                kv("Físicos", info.physical_cores.to_string()),
+                kv("Hilos", info.logical_cores.to_string()),
+                kv("Arq.", info.cpu_arch.clone()),
+                kv("Procesos", app.processes.len().to_string()),
+            ],
+        ],
+    );
+}
+
+fn draw_cpu_per_core(f: &mut Frame, app: &App, area: Rect) {
+    const CELL_WIDTH: usize = 26;
+    const CORE_BAR: usize = 12;
+
+    let cores = app.sys.cpus();
+    let per_row = (area.width as usize / CELL_WIDTH).max(1);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (row, chunk) in cores.chunks(per_row).enumerate() {
+        let mut spans: Vec<Span> = Vec::new();
+        for (col, cpu) in chunk.iter().enumerate() {
+            let idx = row * per_row + col;
+            let pct = cpu.cpu_usage().round().min(100.0) as u64;
+            spans.push(Span::styled(
+                format!("#{idx:<2} "),
+                Style::default().fg(ACCENT),
+            ));
+            spans.extend(bar(pct, CORE_BAR));
+            spans.push(Span::raw(format!(" {pct:>3}%  ")));
+        }
+        lines.push(Line::from(spans));
+    }
+    lines.push(Line::from(""));
+    lines.push(hint("c vuelve a la vista global"));
+
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+// ---------------------------------------------------------------------------
+// Memoria
+// ---------------------------------------------------------------------------
+
+fn draw_ram(f: &mut Frame, app: &App, area: Rect) {
+    let ram_used = app.sys.used_memory();
+    let ram_total = app.sys.total_memory();
+    let swap_used = app.sys.used_swap();
+    let swap_total = app.sys.total_swap();
+    let ram_pct = last(&app.ram_history);
+    let swap_pct = last(&app.swap_history);
+
+    let ram_detail = format!(
+        "{:.2}/{:.2} GB",
+        ram_used as f64 / GIB,
+        ram_total as f64 / GIB
+    );
+    let swap_detail = if swap_total == 0 {
+        "sin swap".to_string()
+    } else {
+        format!(
+            "{:.2}/{:.2} GB",
+            swap_used as f64 / GIB,
+            swap_total as f64 / GIB
+        )
+    };
+
+    if !app.expanded {
+        let spark_w = (area.width as usize).saturating_sub(LABEL_WIDTH).min(60);
+        let bw = bar_width(area);
+        let lines = vec![
+            metric("RAM", ram_pct, ram_detail, bw),
+            spark_line(&app.ram_history, spark_w),
+            Line::from(""),
+            metric("SWAP", swap_pct, swap_detail, bw),
+            spark_line(&app.swap_history, spark_w),
+            Line::from(""),
+            hint("d gráficas y desglose"),
+        ];
+        f.render_widget(Paragraph::new(lines), area);
+        return;
+    }
+
+    let chunks = Layout::vertical([Constraint::Min(6), Constraint::Length(4)]).split(area);
+    let charts = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(chunks[0]);
+
+    let ram_data = series(&app.ram_history);
+    let swap_data = series(&app.swap_history);
+    f.render_widget(
+        history_chart(format!(" RAM {ram_pct}% "), &ram_data, ACCENT),
+        charts[0],
+    );
+    f.render_widget(
+        history_chart(format!(" SWAP {swap_pct}% "), &swap_data, Color::Yellow),
+        charts[1],
+    );
+
+    render_columns(
+        f,
+        chunks[1].inner(Margin::new(1, 0)),
+        vec![
+            vec![
+                kv("Total", format!("{:.2} GB", ram_total as f64 / GIB)),
+                kv("En uso", format!("{:.2} GB", ram_used as f64 / GIB)),
+                kv(
+                    "Disponible",
+                    format!("{:.2} GB", app.sys.available_memory() as f64 / GIB),
+                ),
+                kv(
+                    "Libre",
+                    format!("{:.2} GB", app.sys.free_memory() as f64 / GIB),
+                ),
+            ],
+            vec![
+                kv("Swap", format!("{:.2} GB", swap_total as f64 / GIB)),
+                kv("Swap en uso", format!("{:.2} GB", swap_used as f64 / GIB)),
+                kv(
+                    "Swap libre",
+                    format!(
+                        "{:.2} GB",
+                        swap_total.saturating_sub(swap_used) as f64 / GIB
+                    ),
+                ),
+            ],
+        ],
+    );
+}
+
+// ---------------------------------------------------------------------------
+// GPU
+// ---------------------------------------------------------------------------
+
+fn draw_gpu(f: &mut Frame, app: &App, area: Rect) {
+    let gpu = app.gpu_info();
+    let current = last(&app.gpu_history);
+    let vram = gpu.vram_used.zip(gpu.vram_total);
+
+    if !app.expanded {
+        let bw = bar_width(area);
+        let spark_w = (area.width as usize).saturating_sub(LABEL_WIDTH).min(60);
+        let mut lines = vec![
+            kv("Modelo", gpu.name.clone()),
+            kv("Driver", gpu.driver.clone()),
+            Line::from(""),
+            metric(
+                "Motor",
+                current,
+                gpu.temperature
+                    .map(|t| format!("{t:.0} °C"))
+                    .unwrap_or_default(),
+                bw,
+            ),
+            spark_line(&app.gpu_history, spark_w),
+        ];
+        if let Some((used, total)) = vram {
+            lines.push(metric(
+                "VRAM",
+                pct_of(used, total),
+                format!("{:.2}/{:.2} GB", used as f64 / GIB, total as f64 / GIB),
+                bw,
+            ));
+        }
+        lines.push(Line::from(""));
+        lines.push(hint("d gráfica y detalle"));
+        f.render_widget(Paragraph::new(lines), area);
+        return;
+    }
+
+    let chunks = Layout::vertical([Constraint::Min(6), Constraint::Length(4)]).split(area);
+    let data = series(&app.gpu_history);
+    f.render_widget(
+        history_chart(format!(" GPU {current}% "), &data, Color::Magenta),
+        chunks[0],
+    );
+
+    let na = || "N/D".to_string();
+    render_columns(
+        f,
+        chunks[1].inner(Margin::new(1, 0)),
+        vec![
+            vec![
+                kv("Modelo", gpu.name.clone()),
+                kv("Driver", gpu.driver.clone()),
+                kv(
+                    "Temp.",
+                    gpu.temperature
+                        .map(|t| format!("{t:.1} °C"))
+                        .unwrap_or_else(na),
+                ),
+            ],
+            vec![
+                kv(
+                    "VRAM",
+                    vram.map(|(u, t)| format!("{:.2}/{:.2} GB", u as f64 / GIB, t as f64 / GIB))
+                        .unwrap_or_else(|| "compartida".to_string()),
+                ),
+                kv(
+                    "GTT",
+                    gpu.gtt_used
+                        .zip(gpu.gtt_total)
+                        .map(|(u, t)| format!("{:.2}/{:.2} GB", u as f64 / GIB, t as f64 / GIB))
+                        .unwrap_or_else(na),
+                ),
+                kv("Motor", format!("{current}%")),
+            ],
+        ],
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Disco
+// ---------------------------------------------------------------------------
+
+fn draw_disk(f: &mut Frame, app: &App, area: Rect) {
+    if app.disks.is_empty() {
+        f.render_widget(Paragraph::new(hint("sin discos detectados")), area);
+        return;
+    }
+
+    if app.expanded {
+        let header = Row::new(
+            [
+                "Montaje",
+                "Dispositivo",
+                "FS",
+                "Tipo",
+                "Total",
+                "Usado",
+                "Libre",
+                "Uso",
+            ]
+            .map(Cell::from),
+        )
+        .style(Style::default().fg(DIM).add_modifier(Modifier::BOLD));
+
+        let rows = app.disks.iter().map(|d| {
+            Row::new(vec![
+                Cell::from(d.mount.clone()),
+                Cell::from(d.device.clone()),
+                Cell::from(d.fs.clone()),
+                Cell::from(d.kind.clone()),
+                Cell::from(size(d.total)),
+                Cell::from(size(d.used())),
+                Cell::from(size(d.available)),
+                Cell::from(format!("{}%", d.used_percent())),
+            ])
+        });
+
+        let table = Table::new(
+            rows,
+            [
+                Constraint::Min(10),
+                Constraint::Min(12),
+                Constraint::Length(8),
+                Constraint::Length(6),
+                Constraint::Length(10),
+                Constraint::Length(10),
+                Constraint::Length(10),
+                Constraint::Length(5),
+            ],
+        )
+        .header(header);
+        f.render_widget(table, area);
+        return;
+    }
+
+    // detalle "usado · libre · total" (~44 columnas) junto a la barra
+    let bw = (area.width as usize)
+        .saturating_sub(LABEL_WIDTH + 5 + 46)
+        .clamp(8, 50);
+    let mut lines: Vec<Line> = Vec::new();
+    for d in &app.disks {
+        let name: String = d.mount.chars().take(LABEL_WIDTH - 1).collect();
+        lines.push(metric(
+            &name,
+            d.used_percent(),
+            format!(
+                "{} usado · {} libre · {}",
+                size(d.used()),
+                size(d.available),
+                size(d.total)
+            ),
+            bw,
+        ));
+    }
+    lines.push(Line::from(""));
+    lines.push(hint("d dispositivo, sistema de archivos y tipo"));
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+// ---------------------------------------------------------------------------
+// Tablas
+// ---------------------------------------------------------------------------
+
+fn visible_rows(area: Rect, expanded: bool) -> usize {
+    // título + cabecera
+    let avail = (area.height as usize).saturating_sub(2).max(1);
+    if expanded { avail } else { avail.min(6) }
+}
+
+fn window(state: usize, rows: usize, len: usize) -> (usize, usize) {
+    let start = if state >= rows { state + 1 - rows } else { 0 };
+    (start.min(len), (start + rows).min(len))
+}
+
+fn row_style(selected: bool) -> Style {
+    if selected {
+        Style::default().fg(Color::Black).bg(ACCENT)
+    } else {
+        Style::default()
+    }
+}
+
+fn header_row(cols: [&'static str; 5]) -> Row<'static> {
+    Row::new(cols.map(Cell::from)).style(Style::default().fg(DIM).add_modifier(Modifier::BOLD))
+}
+
+fn table_title(name: &str, count: usize, extra: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            name.to_string(),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        dim(format!(" ({count}){extra}")),
+    ])
+}
+
+fn draw_procs(f: &mut Frame, app: &App, area: Rect) {
+    let parts = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(area);
+    f.render_widget(
+        Paragraph::new(table_title(
+            "Procesos",
+            app.processes.len(),
+            &format!(" · orden: {} [s]", app.process_sort.label()),
+        )),
+        parts[0],
+    );
+
+    let rows = visible_rows(area, app.expanded);
+    let (start, end) = window(app.process_table_state, rows, app.processes.len());
+
+    let body = app.processes[start..end].iter().enumerate().map(|(i, p)| {
+        let mem_mb = p.memory_bytes as f64 / 1_048_576.0;
+        let mem = if mem_mb > 1024.0 {
+            format!("{:.2} GB ({:.1}%)", mem_mb / 1024.0, p.memory_percent)
+        } else {
+            format!("{mem_mb:.1} MB ({:.1}%)", p.memory_percent)
+        };
+        Row::new(vec![
+            Cell::from(p.pid.to_string()),
+            Cell::from(p.name.clone()),
+            Cell::from(format!("{:.1}%", p.cpu_usage)),
+            Cell::from(mem),
+            Cell::from(p.status.clone()),
+        ])
+        .style(row_style(start + i == app.process_table_state))
+    });
+
+    let table = Table::new(
+        body,
+        [
+            Constraint::Length(8),
+            Constraint::Min(12),
+            Constraint::Length(8),
+            Constraint::Length(18),
+            Constraint::Length(10),
+        ],
+    )
+    .header(header_row(["PID", "Nombre", "CPU", "Memoria", "Estado"]));
+    f.render_widget(table, parts[1]);
+}
+
+fn draw_ports(f: &mut Frame, app: &App, area: Rect) {
+    let parts = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(area);
+    f.render_widget(
+        Paragraph::new(table_title("Puertos en escucha", app.ports.len(), "")),
+        parts[0],
+    );
+
+    let rows = visible_rows(area, app.expanded);
+    let (start, end) = window(app.port_table_state, rows, app.ports.len());
+
+    let body = app.ports[start..end].iter().enumerate().map(|(i, p)| {
+        Row::new(vec![
+            Cell::from(p.port.to_string()),
+            Cell::from(p.protocol),
+            Cell::from(p.address.clone()),
+            Cell::from(p.pid.map_or_else(|| "-".to_string(), |pid| pid.to_string())),
+            Cell::from(p.process_name.clone().unwrap_or_else(|| "-".to_string())),
+        ])
+        .style(row_style(start + i == app.port_table_state))
+    });
+
+    let table = Table::new(
+        body,
+        [
+            Constraint::Length(7),
+            Constraint::Length(6),
+            Constraint::Min(16),
+            Constraint::Length(8),
+            Constraint::Min(12),
+        ],
+    )
+    .header(header_row([
+        "Puerto",
+        "Proto",
+        "Dirección",
+        "PID",
+        "Proceso",
+    ]));
+    f.render_widget(table, parts[1]);
+}
+
+// ---------------------------------------------------------------------------
+// Ayuda
+// ---------------------------------------------------------------------------
+
+fn draw_help_modal(f: &mut Frame, area: Rect) {
+    let width = 58.min(area.width.saturating_sub(4));
+    let height = 15.min(area.height.saturating_sub(2));
+    let modal = Rect::new(
+        area.width.saturating_sub(width) / 2,
+        area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    f.render_widget(Clear, modal);
+
+    let key = |k: &str, desc: &str| {
         Line::from(vec![
             Span::styled(
-                "  1, 2, 3, 4      ",
-                Style::default().fg(Color::Yellow).bold(),
+                format!("  {k:<16}"),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             ),
-            Span::raw("Ir a pestaña (Resumen, CPU, RAM, GPU)"),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "  Tab / ← / →     ",
-                Style::default().fg(Color::Yellow).bold(),
-            ),
-            Span::raw("Pestaña siguiente / anterior"),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "  c / C           ",
-                Style::default().fg(Color::Yellow).bold(),
-            ),
-            Span::raw("En pestaña CPU: Alternar Global / Por Núcleo"),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "  p / P           ",
-                Style::default().fg(Color::Yellow).bold(),
-            ),
-            Span::raw("En Resumen: Cambiar foco entre Procesos y Puertos"),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "  s / S           ",
-                Style::default().fg(Color::Yellow).bold(),
-            ),
-            Span::raw("En Resumen: Cambiar criterio de orden de procesos"),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "  ↑ / ↓ / j / k   ",
-                Style::default().fg(Color::Yellow).bold(),
-            ),
-            Span::raw("Desplazar fila en la tabla activa"),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "  PgUp / PgDown   ",
-                Style::default().fg(Color::Yellow).bold(),
-            ),
-            Span::raw("Desplazar 10 elementos en la tabla"),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "  ? / h           ",
-                Style::default().fg(Color::Yellow).bold(),
-            ),
-            Span::raw("Abrir o cerrar esta ventana de ayuda"),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "  q / Esc / Ctrl+C",
-                Style::default().fg(Color::Yellow).bold(),
-            ),
-            Span::raw("Salir de la aplicación"),
-        ]),
+            Span::raw(desc.to_string()),
+        ])
+    };
+
+    let text = vec![
+        key("1-7", "Ir a una pestaña"),
+        key("Tab / ← / →", "Pestaña siguiente / anterior"),
+        key("d", "Desplegar / ocultar detalle de la pestaña"),
+        key("c", "CPU: alternar global / por núcleo"),
+        key("s", "Procesos: cambiar orden"),
+        key("↑ ↓ j k", "Mover fila (Procesos y Puertos)"),
+        key("PgUp / PgDn", "Mover 10 filas"),
+        key("? / h", "Mostrar u ocultar esta ayuda"),
+        key("q / Esc", "Salir"),
     ];
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Double)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT))
         .title(Span::styled(
             " Ayuda ",
-            Style::default().fg(Color::Cyan).bold(),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ));
 
-    let paragraph = Paragraph::new(help_text)
-        .block(block)
-        .wrap(Wrap { trim: true });
+    f.render_widget(
+        Paragraph::new(text).block(block).wrap(Wrap { trim: true }),
+        modal,
+    );
+}
 
-    f.render_widget(paragraph, modal_area);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    fn render(app: &App, w: u16, h: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| draw(f, app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..h)
+            .map(|y| (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn every_view_renders_at_any_size() {
+        let mut app = App::new();
+        for expanded in [false, true] {
+            app.expanded = expanded;
+            for view in CurrentView::ALL {
+                app.set_view(view);
+                for (w, h) in [(100, 30), (80, 24), (40, 10), (10, 3)] {
+                    render(&app, w, h);
+                }
+            }
+        }
+        app.show_help = true;
+        render(&app, 80, 24);
+    }
 }

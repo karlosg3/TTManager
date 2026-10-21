@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::time::Instant;
 use sysinfo::{ProcessesToUpdate, System};
 
+use crate::disk::{DiskItem, collect_disks};
 use crate::gpu::{GpuCollector, GpuInfo};
 use crate::net::{PortItem, collect_listening_ports};
 
@@ -9,10 +10,41 @@ const HISTORY_CAPACITY: usize = 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CurrentView {
-    Overview, // Vista 1: Resumen global, procesos y puertos
-    Cpu,      // Vista 2: Detalle de CPU (Global vs Por Núcleo)
-    Ram,      // Vista 3: Detalle de memoria física y swap
-    Gpu,      // Vista 4: Detalle de cómputo y VRAM
+    Home,  // Resumen estilo neofetch
+    Cpu,   // CPU (Global vs Por Núcleo)
+    Ram,   // Memoria física y swap
+    Gpu,   // Cómputo y VRAM
+    Disk,  // Almacenamiento
+    Procs, // Tabla de procesos
+    Ports, // Tabla de puertos en escucha
+}
+
+impl CurrentView {
+    pub const ALL: [CurrentView; 7] = [
+        CurrentView::Home,
+        CurrentView::Cpu,
+        CurrentView::Ram,
+        CurrentView::Gpu,
+        CurrentView::Disk,
+        CurrentView::Procs,
+        CurrentView::Ports,
+    ];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            CurrentView::Home => "Inicio",
+            CurrentView::Cpu => "CPU",
+            CurrentView::Ram => "Memoria",
+            CurrentView::Gpu => "GPU",
+            CurrentView::Disk => "Disco",
+            CurrentView::Procs => "Procesos",
+            CurrentView::Ports => "Puertos",
+        }
+    }
+
+    fn index(self) -> usize {
+        Self::ALL.iter().position(|v| *v == self).unwrap_or(0)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,12 +70,6 @@ impl ProcessSort {
             ProcessSort::Name => "Nombre A-Z",
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OverviewFocus {
-    Processes,
-    Ports,
 }
 
 #[derive(Debug, Clone)]
@@ -73,6 +99,7 @@ pub struct App {
     pub cpu_mode: CpuMode,
     pub should_quit: bool,
     pub show_help: bool,
+    pub expanded: bool,
 
     // Buffers circulares para gráficas de historial (máximo 60 muestras)
     pub cpu_history: VecDeque<u64>,
@@ -86,14 +113,15 @@ pub struct App {
     pub system_info: SystemInfo,
     pub processes: Vec<ProcessItem>,
     pub ports: Vec<PortItem>,
+    pub disks: Vec<DiskItem>,
 
     pub process_sort: ProcessSort,
-    pub overview_focus: OverviewFocus,
     pub process_table_state: usize,
     pub port_table_state: usize,
 
     last_proc_update: Instant,
     last_net_update: Instant,
+    last_disk_update: Instant,
 }
 
 impl App {
@@ -173,10 +201,11 @@ impl App {
         let ports = collect_listening_ports(&sys);
 
         let mut app = Self {
-            current_view: CurrentView::Overview,
+            current_view: CurrentView::Home,
             cpu_mode: CpuMode::Global,
             should_quit: false,
             show_help: false,
+            expanded: false,
             cpu_history,
             ram_history,
             gpu_history,
@@ -187,12 +216,13 @@ impl App {
             system_info,
             processes: Vec::new(),
             ports,
+            disks: collect_disks(),
             process_sort: ProcessSort::CpuDesc,
-            overview_focus: OverviewFocus::Processes,
             process_table_state: 0,
             port_table_state: 0,
             last_proc_update: Instant::now(),
             last_net_update: Instant::now(),
+            last_disk_update: Instant::now(),
         };
 
         app.update_processes();
@@ -253,6 +283,12 @@ impl App {
             self.ports = collect_listening_ports(&self.sys);
             self.last_net_update = Instant::now();
         }
+
+        // El almacenamiento cambia despacio: ~5 s
+        if self.last_disk_update.elapsed().as_secs() >= 5 {
+            self.disks = collect_disks();
+            self.last_disk_update = Instant::now();
+        }
     }
 
     pub fn update_processes(&mut self) {
@@ -307,21 +343,13 @@ impl App {
     }
 
     pub fn next_view(&mut self) {
-        self.current_view = match self.current_view {
-            CurrentView::Overview => CurrentView::Cpu,
-            CurrentView::Cpu => CurrentView::Ram,
-            CurrentView::Ram => CurrentView::Gpu,
-            CurrentView::Gpu => CurrentView::Overview,
-        };
+        let all = CurrentView::ALL;
+        self.current_view = all[(self.current_view.index() + 1) % all.len()];
     }
 
     pub fn prev_view(&mut self) {
-        self.current_view = match self.current_view {
-            CurrentView::Overview => CurrentView::Gpu,
-            CurrentView::Cpu => CurrentView::Overview,
-            CurrentView::Ram => CurrentView::Cpu,
-            CurrentView::Gpu => CurrentView::Ram,
-        };
+        let all = CurrentView::ALL;
+        self.current_view = all[(self.current_view.index() + all.len() - 1) % all.len()];
     }
 
     pub fn set_view(&mut self, view: CurrentView) {
@@ -333,6 +361,14 @@ impl App {
             CpuMode::Global => CpuMode::PerCore,
             CpuMode::PerCore => CpuMode::Global,
         };
+        // La vista por núcleo solo existe en modo detallado
+        if self.cpu_mode == CpuMode::PerCore {
+            self.expanded = true;
+        }
+    }
+
+    pub fn toggle_expanded(&mut self) {
+        self.expanded = !self.expanded;
     }
 
     pub fn toggle_process_sort(&mut self) {
@@ -345,69 +381,36 @@ impl App {
         self.update_processes();
     }
 
-    pub fn toggle_overview_focus(&mut self) {
-        self.overview_focus = match self.overview_focus {
-            OverviewFocus::Processes => OverviewFocus::Ports,
-            OverviewFocus::Ports => OverviewFocus::Processes,
-        };
+    fn active_table(&mut self) -> Option<(&mut usize, usize)> {
+        match self.current_view {
+            CurrentView::Procs => Some((&mut self.process_table_state, self.processes.len())),
+            CurrentView::Ports => Some((&mut self.port_table_state, self.ports.len())),
+            _ => None,
+        }
+    }
+
+    fn move_cursor(&mut self, delta: isize) {
+        if let Some((state, len)) = self.active_table()
+            && len > 0
+        {
+            *state = state.saturating_add_signed(delta).min(len - 1);
+        }
     }
 
     pub fn scroll_up(&mut self) {
-        match self.overview_focus {
-            OverviewFocus::Processes => {
-                if self.process_table_state > 0 {
-                    self.process_table_state -= 1;
-                }
-            }
-            OverviewFocus::Ports => {
-                if self.port_table_state > 0 {
-                    self.port_table_state -= 1;
-                }
-            }
-        }
+        self.move_cursor(-1);
     }
 
     pub fn scroll_down(&mut self) {
-        match self.overview_focus {
-            OverviewFocus::Processes => {
-                if !self.processes.is_empty() && self.process_table_state < self.processes.len() - 1
-                {
-                    self.process_table_state += 1;
-                }
-            }
-            OverviewFocus::Ports => {
-                if !self.ports.is_empty() && self.port_table_state < self.ports.len() - 1 {
-                    self.port_table_state += 1;
-                }
-            }
-        }
+        self.move_cursor(1);
     }
 
     pub fn page_up(&mut self) {
-        match self.overview_focus {
-            OverviewFocus::Processes => {
-                self.process_table_state = self.process_table_state.saturating_sub(10);
-            }
-            OverviewFocus::Ports => {
-                self.port_table_state = self.port_table_state.saturating_sub(10);
-            }
-        }
+        self.move_cursor(-10);
     }
 
     pub fn page_down(&mut self) {
-        match self.overview_focus {
-            OverviewFocus::Processes => {
-                if !self.processes.is_empty() {
-                    self.process_table_state =
-                        (self.process_table_state + 10).min(self.processes.len() - 1);
-                }
-            }
-            OverviewFocus::Ports => {
-                if !self.ports.is_empty() {
-                    self.port_table_state = (self.port_table_state + 10).min(self.ports.len() - 1);
-                }
-            }
-        }
+        self.move_cursor(10);
     }
 
     pub fn toggle_help(&mut self) {
@@ -429,6 +432,14 @@ impl App {
         } else {
             format!("{hours:02}:{mins:02}:{s:02}")
         }
+    }
+
+    /// Disco principal para el resumen: la raíz, o el primero disponible
+    pub fn primary_disk(&self) -> Option<&DiskItem> {
+        self.disks
+            .iter()
+            .find(|d| d.mount == "/")
+            .or_else(|| self.disks.first())
     }
 
     pub fn gpu_info(&self) -> &GpuInfo {
@@ -470,33 +481,54 @@ mod tests {
 #[test]
 fn test_navigation_and_modes() {
     let mut app = App::new();
-    assert_eq!(app.current_view, CurrentView::Overview);
+    assert_eq!(app.current_view, CurrentView::Home);
 
-    app.next_view();
-    assert_eq!(app.current_view, CurrentView::Cpu);
-    app.next_view();
-    assert_eq!(app.current_view, CurrentView::Ram);
-    app.next_view();
-    assert_eq!(app.current_view, CurrentView::Gpu);
-    app.next_view();
-    assert_eq!(app.current_view, CurrentView::Overview);
+    for expected in [
+        CurrentView::Cpu,
+        CurrentView::Ram,
+        CurrentView::Gpu,
+        CurrentView::Disk,
+        CurrentView::Procs,
+        CurrentView::Ports,
+        CurrentView::Home,
+    ] {
+        app.next_view();
+        assert_eq!(app.current_view, expected);
+    }
 
     app.prev_view();
-    assert_eq!(app.current_view, CurrentView::Gpu);
+    assert_eq!(app.current_view, CurrentView::Ports);
+
+    assert!(!app.expanded);
+    app.toggle_expanded();
+    assert!(app.expanded);
+    app.toggle_expanded();
 
     assert_eq!(app.cpu_mode, CpuMode::Global);
     app.toggle_cpu_mode();
     assert_eq!(app.cpu_mode, CpuMode::PerCore);
+    assert!(app.expanded);
     app.toggle_cpu_mode();
     assert_eq!(app.cpu_mode, CpuMode::Global);
-
-    assert_eq!(app.overview_focus, OverviewFocus::Processes);
-    app.toggle_overview_focus();
-    assert_eq!(app.overview_focus, OverviewFocus::Ports);
 
     assert_eq!(app.process_sort, ProcessSort::CpuDesc);
     app.toggle_process_sort();
     assert_eq!(app.process_sort, ProcessSort::MemDesc);
+}
+
+#[test]
+fn test_scroll_only_in_tables() {
+    let mut app = App::new();
+    app.scroll_down();
+    assert_eq!(app.process_table_state, 0);
+
+    app.set_view(CurrentView::Procs);
+    app.scroll_down();
+    assert_eq!(app.process_table_state, 1);
+    app.scroll_up();
+    assert_eq!(app.process_table_state, 0);
+    app.page_down();
+    assert_eq!(app.process_table_state, 10.min(app.processes.len() - 1));
 }
 
 #[test]
