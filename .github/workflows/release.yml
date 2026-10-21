@@ -1,0 +1,49 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    # glibc más antigua = binario compatible con más distribuciones
+    runs-on: ubuntu-22.04
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Check tag matches Cargo.toml version
+      run: |
+        version=$(cargo metadata --no-deps --format-version 1 | python3 -c "import sys, json; print(json.load(sys.stdin)['packages'][0]['version'])")
+        if [ "v$version" != "${{ github.ref_name }}" ]; then
+          echo "Tag ${{ github.ref_name }} does not match Cargo.toml version v$version"
+          exit 1
+        fi
+
+    - name: Test
+      run: cargo test --locked
+
+    - name: Build
+      run: cargo build --release --locked
+
+    - name: Package
+      run: |
+        name="ttm-${{ github.ref_name }}-linux-x86_64"
+        mkdir "$name"
+        cp target/release/ttm LICENSE README.md "$name/"
+        tar -czf "$name.tar.gz" "$name"
+        sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+
+    - name: Publish release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: |
+          ttm-*.tar.gz
+          ttm-*.tar.gz.sha256
+        generate_release_notes: true

@@ -1,4 +1,4 @@
-# sys_monitor
+# TTM (TuiTaskManager)
 
 Un monitor de recursos del sistema para Linux de alto rendimiento, modular y con interfaz en terminal (TUI) inspirado en el Administrador de Tareas de Windows. Desarrollado en Rust con [`ratatui`](https://crates.io/crates/ratatui), [`crossterm`](https://crates.io/crates/crossterm), [`sysinfo`](https://crates.io/crates/sysinfo) y [`clap`](https://crates.io/crates/clap).
 
@@ -61,11 +61,20 @@ cargo run -- -v cpu
 cargo run -- -v procs
 ```
 
+### Descarga (Releases)
+
+Cada versión publicada en [Releases](https://github.com/karlosg3/TTManager/releases) incluye un binario para Linux x86_64:
+
+```bash
+tar -xzf ttm-vX.Y.Z-linux-x86_64.tar.gz
+./ttm
+```
+
 ### Compilación para Producción
 
 ```bash
 cargo build --release
-./target/release/sys_monitor
+./target/release/ttm
 ```
 
 ---
@@ -73,7 +82,7 @@ cargo build --release
 ## Estructura del Código
 
 ```text
-sys_monitor/
+ttm/
 ├── Cargo.toml      # Configuración del paquete y dependencias
 ├── Cargo.lock      # Versiones bloqueadas de dependencias
 ├── README.md       # Documentación completa del proyecto
