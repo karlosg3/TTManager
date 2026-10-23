@@ -13,6 +13,7 @@ use ratatui::{
 };
 
 use crate::app::{App, CpuMode, CurrentView};
+use crate::apps::{AppAction, AppItem};
 use crate::power::{Battery, ChargeState, PowerInfo};
 use crate::updater::Version;
 
@@ -52,6 +53,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         CurrentView::Ram => draw_ram(f, app, body),
         CurrentView::Gpu => draw_gpu(f, app, body),
         CurrentView::Disk => draw_disk(f, app, body),
+        CurrentView::Apps => draw_apps(f, app, body),
         CurrentView::Procs => draw_procs(f, app, body),
         CurrentView::Ports => draw_ports(f, app, body),
         CurrentView::Power => draw_power(f, app, body),
@@ -66,6 +68,9 @@ pub fn draw(f: &mut Frame, app: &App) {
         && let Some(version) = app.update_available
     {
         draw_update_modal(f, size, version);
+    }
+    if let Some((action, target)) = &app.pending_action {
+        draw_app_action_modal(f, size, *action, target);
     }
 }
 
@@ -287,12 +292,25 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
+    // El resultado de cerrar/reiniciar sustituye a los atajos unos segundos
+    if let Some((message, at)) = &app.status
+        && at.elapsed().as_secs() < 5
+    {
+        f.render_widget(
+            Paragraph::new(message.clone())
+                .style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
+                .alignment(Alignment::Center),
+            area,
+        );
+        return;
+    }
+
     let mut hints = vec![];
     if let Some(version) = app.update_available {
         hints.push(format!("u actualizar a v{version}"));
     }
     hints.extend([
-        "1-8 pestañas".to_string(),
+        "1-9 pestañas".to_string(),
         "←/→ navegar".to_string(),
         format!("d detalle [{}]", if app.expanded { "on" } else { "off" }),
     ]);
@@ -303,6 +321,11 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             hints.push("↑/↓ mover".to_string());
         }
         CurrentView::Ports => hints.push("↑/↓ mover".to_string()),
+        CurrentView::Apps => {
+            // Sin "←/→ navegar" para que quepan las acciones
+            hints.retain(|h| h != "←/→ navegar");
+            hints.extend(["s orden", "↑/↓ mover", "r reiniciar", "x cerrar"].map(String::from));
+        }
         _ => {}
     }
     hints.push("? ayuda".to_string());
@@ -873,6 +896,75 @@ fn table_title(name: &str, count: usize, extra: &str) -> Line<'static> {
     ])
 }
 
+fn memory(bytes: u64) -> String {
+    let mb = bytes as f64 / 1_048_576.0;
+    if mb >= 1024.0 {
+        format!("{:.2} GB", mb / 1024.0)
+    } else {
+        format!("{mb:.0} MB")
+    }
+}
+
+fn draw_apps(f: &mut Frame, app: &App, area: Rect) {
+    let parts = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(area);
+    f.render_widget(
+        Paragraph::new(table_title(
+            "Aplicaciones",
+            app.apps.len(),
+            &format!(" · orden: {} [s]", app.app_sort.label()),
+        )),
+        parts[0],
+    );
+
+    if app.apps.is_empty() {
+        f.render_widget(
+            Paragraph::new(hint(
+                "no se encontraron aplicaciones de escritorio abiertas",
+            )),
+            parts[1],
+        );
+        return;
+    }
+
+    let rows = visible_rows(area, app.expanded);
+    let (start, end) = window(app.app_table_state, rows, app.apps.len());
+
+    let body = app.apps[start..end].iter().enumerate().map(|(i, a)| {
+        let selected = start + i == app.app_table_state;
+        let pct = a.cpu.round() as u64;
+        // La barra pierde su color sobre el fondo de selección: ahí solo texto
+        let cpu = if selected {
+            Line::from(format!("{:.1}%", a.cpu))
+        } else {
+            let mut spans = bar(pct, 8);
+            spans.push(Span::raw(format!(" {:.1}%", a.cpu)));
+            Line::from(spans)
+        };
+        Row::new(vec![
+            Cell::from(a.name.clone()),
+            Cell::from(a.pids.len().to_string()),
+            Cell::from(cpu),
+            Cell::from(memory(a.memory_bytes)),
+        ])
+        .style(row_style(selected))
+    });
+
+    let table = Table::new(
+        body,
+        [
+            Constraint::Min(16),
+            Constraint::Length(9),
+            Constraint::Length(16),
+            Constraint::Length(10),
+        ],
+    )
+    .header(
+        Row::new(["Aplicación", "Procesos", "CPU", "Memoria"].map(Cell::from))
+            .style(Style::default().fg(DIM).add_modifier(Modifier::BOLD)),
+    );
+    f.render_widget(table, parts[1]);
+}
+
 fn draw_procs(f: &mut Frame, app: &App, area: Rect) {
     let parts = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(area);
     f.render_widget(
@@ -1102,12 +1194,13 @@ fn draw_help_modal(f: &mut Frame, area: Rect) {
     };
 
     let text = vec![
-        key("1-8", "Ir a una pestaña"),
+        key("1-9", "Ir a una pestaña"),
         key("Tab / ← / →", "Pestaña siguiente / anterior"),
         key("d", "Desplegar / ocultar detalle de la pestaña"),
         key("c", "CPU: alternar global / por núcleo"),
-        key("s", "Procesos: cambiar orden"),
-        key("↑ ↓ j k", "Mover fila (Procesos y Puertos)"),
+        key("s", "Apps y Procesos: cambiar orden"),
+        key("r / x", "Apps: reiniciar / cerrar la aplicación"),
+        key("↑ ↓ j k", "Mover fila (Apps, Procesos y Puertos)"),
         key("PgUp / PgDn", "Mover 10 filas"),
         key("u", "Actualizar si hay una versión nueva"),
         key("? / h", "Mostrar u ocultar esta ayuda"),
@@ -1183,6 +1276,68 @@ fn draw_update_modal(f: &mut Frame, area: Rect, version: Version) {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Confirmar cerrar / reiniciar
+// ---------------------------------------------------------------------------
+
+fn draw_app_action_modal(f: &mut Frame, area: Rect, action: AppAction, target: &AppItem) {
+    let modal = centered(area, 60, 9);
+    f.render_widget(Clear, modal);
+
+    let bold = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
+    let (title, question, note) = match action {
+        AppAction::Restart => (
+            " Reiniciar aplicación ",
+            "¿Reiniciar",
+            format!(
+                "Se cerrará y se volverá a abrir con: {}",
+                target.exec.join(" ")
+            ),
+        ),
+        _ => (
+            " Cerrar aplicación ",
+            "¿Cerrar",
+            "Con [f] se cierra al instante y se pierde lo no guardado.".to_string(),
+        ),
+    };
+
+    let mut options = vec![Span::styled("[s]", bold), Span::raw(" Sí   ")];
+    if action == AppAction::Close {
+        options.extend([Span::styled("[f]", bold), Span::raw(" Forzar   ")]);
+    }
+    options.extend([Span::styled("[Esc]", bold), Span::raw(" Cancelar")]);
+
+    let text = vec![
+        Line::from(vec![
+            Span::raw(format!("{question} ")),
+            Span::styled(target.name.clone(), bold),
+            Span::raw("?"),
+        ]),
+        Line::from(dim(format!(
+            "{} procesos · {}",
+            target.pids.len(),
+            memory(target.memory_bytes)
+        ))),
+        Line::from(""),
+        Line::from(dim(note)),
+        Line::from(""),
+        Line::from(options),
+    ];
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT))
+        .title(Span::styled(title, bold));
+
+    f.render_widget(
+        Paragraph::new(text)
+            .block(block.padding(ratatui::widgets::Padding::horizontal(1)))
+            .wrap(Wrap { trim: true }),
+        modal,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1214,6 +1369,24 @@ mod tests {
         render(&app, 80, 24);
 
         app.show_help = false;
+        let target = crate::apps::AppItem {
+            name: "Firefox".to_string(),
+            pids: vec![1, 2],
+            cpu: 12.5,
+            memory_bytes: 3 << 30,
+            exec: vec!["firefox".to_string()],
+            contains_self: false,
+        };
+        app.apps = vec![target.clone()];
+        app.set_view(CurrentView::Apps);
+        for action in [AppAction::Close, AppAction::Restart] {
+            app.pending_action = Some((action, target.clone()));
+            for (w, h) in [(100, 30), (40, 10), (10, 3)] {
+                render(&app, w, h);
+            }
+        }
+        app.pending_action = None;
+
         app.update_available = Version::parse("9.9.9");
         app.show_update_prompt = true;
         for (w, h) in [(100, 30), (40, 10), (10, 3)] {

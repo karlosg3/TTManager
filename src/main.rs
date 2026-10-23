@@ -1,4 +1,5 @@
 mod app;
+mod apps;
 mod disk;
 mod gpu;
 mod net;
@@ -19,6 +20,7 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 
 use app::{App, CurrentView};
+use apps::AppAction;
 
 /// TTM (TuiTaskManager) - Monitor de recursos del sistema para Linux
 #[derive(Parser, Debug)]
@@ -28,7 +30,7 @@ struct Cli {
     #[arg(short, long, default_value_t = 1000)]
     interval: u64,
 
-    /// Vista inicial: home, cpu, ram, gpu, disk, procs, ports, power
+    /// Vista inicial: home, cpu, ram, gpu, disk, apps, procs, ports, power
     #[arg(short, long, default_value = "home")]
     view: String,
 
@@ -75,6 +77,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "ram" | "mem" => app.set_view(CurrentView::Ram),
         "gpu" => app.set_view(CurrentView::Gpu),
         "disk" | "disco" | "storage" => app.set_view(CurrentView::Disk),
+        "apps" | "aplicaciones" => app.set_view(CurrentView::Apps),
         "procs" | "procesos" => app.set_view(CurrentView::Procs),
         "ports" | "puertos" => app.set_view(CurrentView::Ports),
         "power" | "energia" | "energía" | "battery" | "bateria" => {
@@ -119,6 +122,19 @@ fn main() -> Result<(), Box<dyn Error>> {
                 continue;
             }
 
+            // Confirmación de cerrar/reiniciar una aplicación
+            if app.pending_action.is_some() {
+                match key.code {
+                    KeyCode::Char('s' | 'S' | 'y' | 'Y') | KeyCode::Enter => {
+                        app.confirm_app_action(false)
+                    }
+                    KeyCode::Char('f' | 'F') => app.confirm_app_action(true),
+                    KeyCode::Char('n' | 'N') | KeyCode::Esc => app.cancel_app_action(),
+                    _ => {}
+                }
+                continue;
+            }
+
             match key.code {
                 KeyCode::Char('q') => app.quit(),
                 KeyCode::Esc => {
@@ -132,7 +148,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                 KeyCode::Char('u') | KeyCode::Char('U') => app.open_update_prompt(),
                 KeyCode::Char('c') | KeyCode::Char('C') => app.toggle_cpu_mode(),
                 KeyCode::Char('d') | KeyCode::Char('D') => app.toggle_expanded(),
-                KeyCode::Char('s') | KeyCode::Char('S') => app.toggle_process_sort(),
+                KeyCode::Char('s') | KeyCode::Char('S') => app.toggle_sort(),
+                KeyCode::Char('x') | KeyCode::Char('X') => app.request_app_action(AppAction::Close),
+                KeyCode::Char('r') | KeyCode::Char('R') => {
+                    app.request_app_action(AppAction::Restart)
+                }
                 KeyCode::Tab => app.next_view(),
                 KeyCode::BackTab => app.prev_view(),
                 KeyCode::Right => app.next_view(),
@@ -142,9 +162,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                 KeyCode::Char('3') => app.set_view(CurrentView::Ram),
                 KeyCode::Char('4') => app.set_view(CurrentView::Gpu),
                 KeyCode::Char('5') => app.set_view(CurrentView::Disk),
-                KeyCode::Char('6') => app.set_view(CurrentView::Procs),
-                KeyCode::Char('7') => app.set_view(CurrentView::Ports),
-                KeyCode::Char('8') => app.set_view(CurrentView::Power),
+                KeyCode::Char('6') => app.set_view(CurrentView::Apps),
+                KeyCode::Char('7') => app.set_view(CurrentView::Procs),
+                KeyCode::Char('8') => app.set_view(CurrentView::Ports),
+                KeyCode::Char('9') => app.set_view(CurrentView::Power),
                 KeyCode::Up | KeyCode::Char('k') => app.scroll_up(),
                 KeyCode::Down | KeyCode::Char('j') => app.scroll_down(),
                 KeyCode::PageUp => app.page_up(),

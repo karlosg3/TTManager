@@ -15,9 +15,10 @@ Minimalista y pensado para dejarlo siempre abierto: por defecto cada pestaña mu
 | **3 Memoria** | Barras de RAM y SWAP con mini-gráficas | Gráficas duales y desglose (total, en uso, disponible, libre) |
 | **4 GPU** | Modelo, driver, uso del motor, temperatura y VRAM | Gráfica de 60 s, VRAM, GTT y sensores |
 | **5 Disco** | Una barra por disco con usado, libre y total | Tabla con montaje, dispositivo, sistema de archivos y tipo |
-| **6 Procesos** | Los 6 primeros, con orden configurable (`s`) | Tabla completa a pantalla completa |
-| **7 Puertos** | Los 6 primeros puertos en escucha | Tabla completa a pantalla completa |
-| **8 Energía** | Fuente (batería, cargador o corriente directa), carga, salud, consumo y tiempo restante | Gráfica de 60 s, energía actual/máxima/de fábrica, ciclos, voltaje y modelo |
+| **6 Apps** | Aplicaciones abiertas con sus procesos, CPU y RAM sumados; orden por CPU, RAM o nombre (`s`) | Tabla completa; `r` reinicia y `x` cierra la seleccionada (con confirmación) |
+| **7 Procesos** | Los 6 primeros, con orden configurable (`s`) | Tabla completa a pantalla completa |
+| **8 Puertos** | Los 6 primeros puertos en escucha | Tabla completa a pantalla completa |
+| **9 Energía** | Fuente (batería, cargador o corriente directa), carga, salud, consumo y tiempo restante | Gráfica de 60 s, energía actual/máxima/de fábrica, ciclos, voltaje y modelo |
 
 ---
 
@@ -25,13 +26,14 @@ Minimalista y pensado para dejarlo siempre abierto: por defecto cada pestaña mu
 
 | Atajo | Acción |
 | :--- | :--- |
-| `1`-`8` | Ir directamente a una pestaña |
+| `1`-`9` | Ir directamente a una pestaña |
 | `Tab` / `→` | Pestaña siguiente |
 | `Shift+Tab` / `←` | Pestaña anterior |
 | `d` | Desplegar / ocultar el detalle de la pestaña actual |
 | `c` | En CPU: alternar **Global** vs **Por Núcleo** (activa el detalle) |
-| `s` | En Procesos: cambiar orden (CPU %, RAM MB, PID, Nombre) |
-| `↑` / `↓` / `k` / `j` | Mover la fila seleccionada (Procesos y Puertos) |
+| `s` | En Apps y Procesos: cambiar orden |
+| `r` / `x` | En Apps: reiniciar / cerrar la aplicación (`f` en la confirmación fuerza el cierre) |
+| `↑` / `↓` / `k` / `j` | Mover la fila seleccionada (Apps, Procesos y Puertos) |
 | `PgUp` / `PgDown` | Mover 10 filas |
 | `u` | Actualizar, si hay una versión nueva |
 | `?` / `h` | Mostrar / ocultar ayuda |
@@ -58,7 +60,7 @@ cargo run
 # Cambiar intervalo de actualización a 500 ms
 cargo run -- -i 500
 
-# Iniciar directamente en otra pestaña: home, cpu, ram, gpu, disk, procs, ports, power
+# Iniciar directamente en otra pestaña: home, cpu, ram, gpu, disk, apps, procs, ports, power
 cargo run -- -v cpu
 cargo run -- -v procs
 ```
@@ -106,6 +108,7 @@ ttm/
     ├── main.rs     # Orquestador del ciclo de vida, parser CLI y bucle de eventos
     ├── app.rs      # Estado de la aplicación, buffers históricos (VecDeque) y lógica
     ├── ui.rs       # Renderizado de componentes visuales, layouts y widgets Ratatui
+    ├── apps.rs     # Agrupa procesos en aplicaciones (.desktop) y las cierra o reinicia
     ├── disk.rs     # Detección de discos y particiones montadas
     ├── gpu.rs      # Detección y muestreo de GPU (AMD sysfs, NVIDIA SMI, Intel, lspci)
     ├── net.rs      # Mapeo de sockets y puertos locales a PIDs (/proc/net, /proc/*/fd)

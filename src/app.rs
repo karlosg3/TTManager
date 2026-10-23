@@ -1,8 +1,9 @@
 use std::collections::VecDeque;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Instant;
 use sysinfo::{ProcessesToUpdate, System};
 
+use crate::apps::{AppAction, AppItem, DesktopEntry, collect_apps, load_desktop_entries};
 use crate::disk::{DiskItem, collect_disks};
 use crate::gpu::{GpuCollector, GpuInfo};
 use crate::net::{PortItem, collect_listening_ports};
@@ -18,18 +19,20 @@ pub enum CurrentView {
     Ram,   // Memoria física y swap
     Gpu,   // Cómputo y VRAM
     Disk,  // Almacenamiento
+    Apps,  // Aplicaciones (procesos agrupados)
     Procs, // Tabla de procesos
     Ports, // Tabla de puertos en escucha
     Power, // Batería y fuente de energía
 }
 
 impl CurrentView {
-    pub const ALL: [CurrentView; 8] = [
+    pub const ALL: [CurrentView; 9] = [
         CurrentView::Home,
         CurrentView::Cpu,
         CurrentView::Ram,
         CurrentView::Gpu,
         CurrentView::Disk,
+        CurrentView::Apps,
         CurrentView::Procs,
         CurrentView::Ports,
         CurrentView::Power,
@@ -42,6 +45,7 @@ impl CurrentView {
             CurrentView::Ram => "Memoria",
             CurrentView::Gpu => "GPU",
             CurrentView::Disk => "Disco",
+            CurrentView::Apps => "Apps",
             CurrentView::Procs => "Procesos",
             CurrentView::Ports => "Puertos",
             CurrentView::Power => "Energía",
@@ -57,6 +61,23 @@ impl CurrentView {
 pub enum CpuMode {
     Global,
     PerCore,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppSort {
+    CpuDesc,
+    MemDesc,
+    Name,
+}
+
+impl AppSort {
+    pub fn label(&self) -> &'static str {
+        match self {
+            AppSort::CpuDesc => "CPU % ↓",
+            AppSort::MemDesc => "RAM ↓",
+            AppSort::Name => "Nombre A-Z",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,6 +147,19 @@ pub struct App {
     pub process_sort: ProcessSort,
     pub process_table_state: usize,
     pub port_table_state: usize,
+
+    // Aplicaciones: los .desktop se leen una vez al arrancar
+    desktop_entries: Vec<DesktopEntry>,
+    pub apps: Vec<AppItem>,
+    pub app_sort: AppSort,
+    pub app_table_state: usize,
+    /// Acción esperando confirmación en el aviso (la app se copia aquí para
+    /// que un reordenamiento no cambie a quién se cierra)
+    pub pending_action: Option<(AppAction, AppItem)>,
+    /// Mensaje temporal en el pie (resultado de cerrar/reiniciar)
+    pub status: Option<(String, Instant)>,
+    action_tx: Sender<String>,
+    action_rx: Receiver<String>,
 
     // Actualizaciones: versión nueva encontrada, aviso abierto y respuesta
     pub update_available: Option<Version>,
@@ -220,6 +254,8 @@ impl App {
             battery_history.push_back(capacity);
         }
 
+        let (action_tx, action_rx) = mpsc::channel();
+
         let mut app = Self {
             current_view: CurrentView::Home,
             cpu_mode: CpuMode::Global,
@@ -240,6 +276,14 @@ impl App {
             disks: collect_disks(),
             power,
             process_sort: ProcessSort::CpuDesc,
+            desktop_entries: load_desktop_entries(),
+            apps: Vec::new(),
+            app_sort: AppSort::CpuDesc,
+            app_table_state: 0,
+            pending_action: None,
+            status: None,
+            action_tx,
+            action_rx,
             process_table_state: 0,
             port_table_state: 0,
             update_available: None,
@@ -253,6 +297,7 @@ impl App {
         };
 
         app.update_processes();
+        app.update_apps();
         app
     }
 
@@ -314,7 +359,13 @@ impl App {
         if self.last_proc_update.elapsed().as_millis() >= 1500 {
             self.sys.refresh_processes(ProcessesToUpdate::All, true);
             self.update_processes();
+            self.update_apps();
             self.last_proc_update = Instant::now();
+        }
+
+        // Resultados de cerrar/reiniciar que llegan desde sus hilos
+        while let Ok(message) = self.action_rx.try_recv() {
+            self.status = Some((message, Instant::now()));
         }
 
         // Update listening ports every ~4.0s
@@ -419,6 +470,87 @@ impl App {
         self.expanded = !self.expanded;
     }
 
+    pub fn update_apps(&mut self) {
+        // La selección sigue a la app (por nombre), no a la fila: al reordenar
+        // por CPU las filas cambian de sitio en cada refresco
+        let selected = self.apps.get(self.app_table_state).map(|a| a.name.clone());
+
+        let mut apps = collect_apps(&self.sys, &self.desktop_entries);
+        match self.app_sort {
+            AppSort::CpuDesc => apps.sort_by(|a, b| b.cpu.total_cmp(&a.cpu)),
+            AppSort::MemDesc => apps.sort_by_key(|a| std::cmp::Reverse(a.memory_bytes)),
+            AppSort::Name => apps.sort_by_key(|a| a.name.to_lowercase()),
+        }
+        self.apps = apps;
+
+        self.app_table_state = selected
+            .and_then(|name| self.apps.iter().position(|a| a.name == name))
+            .unwrap_or(self.app_table_state)
+            .min(self.apps.len().saturating_sub(1));
+    }
+
+    pub fn toggle_app_sort(&mut self) {
+        self.app_sort = match self.app_sort {
+            AppSort::CpuDesc => AppSort::MemDesc,
+            AppSort::MemDesc => AppSort::Name,
+            AppSort::Name => AppSort::CpuDesc,
+        };
+        self.update_apps();
+    }
+
+    /// `x` / `r` en la pestaña Apps: abre la confirmación
+    pub fn request_app_action(&mut self, action: AppAction) {
+        if self.current_view != CurrentView::Apps {
+            return;
+        }
+        let Some(app) = self.apps.get(self.app_table_state) else {
+            return;
+        };
+        if app.contains_self {
+            let message = format!(
+                "ttm se ejecuta dentro de {}: ciérrala desde fuera",
+                app.name
+            );
+            self.status = Some((message, Instant::now()));
+            return;
+        }
+        self.pending_action = Some((action, app.clone()));
+    }
+
+    /// Respuesta al aviso. `ForceClose` solo vale si se pidió cerrar.
+    pub fn confirm_app_action(&mut self, force: bool) {
+        let Some((action, app)) = self.pending_action.take() else {
+            return;
+        };
+        let action = match (action, force) {
+            (AppAction::Close, true) => AppAction::ForceClose,
+            (_, true) => {
+                self.pending_action = Some((action, app));
+                return;
+            }
+            (action, false) => action,
+        };
+        let verb = match action {
+            AppAction::Close => "Cerrando",
+            AppAction::ForceClose => "Forzando el cierre de",
+            AppAction::Restart => "Reiniciando",
+        };
+        self.status = Some((format!("{verb} {}…", app.name), Instant::now()));
+        crate::apps::run_action(&self.sys, &app, action, self.action_tx.clone());
+    }
+
+    pub fn cancel_app_action(&mut self) {
+        self.pending_action = None;
+    }
+
+    /// `s`: ordena la tabla de la pestaña actual
+    pub fn toggle_sort(&mut self) {
+        match self.current_view {
+            CurrentView::Apps => self.toggle_app_sort(),
+            _ => self.toggle_process_sort(),
+        }
+    }
+
     pub fn toggle_process_sort(&mut self) {
         self.process_sort = match self.process_sort {
             ProcessSort::CpuDesc => ProcessSort::MemDesc,
@@ -431,6 +563,7 @@ impl App {
 
     fn active_table(&mut self) -> Option<(&mut usize, usize)> {
         match self.current_view {
+            CurrentView::Apps => Some((&mut self.app_table_state, self.apps.len())),
             CurrentView::Procs => Some((&mut self.process_table_state, self.processes.len())),
             CurrentView::Ports => Some((&mut self.port_table_state, self.ports.len())),
             _ => None,
@@ -559,6 +692,7 @@ fn test_navigation_and_modes() {
         CurrentView::Ram,
         CurrentView::Gpu,
         CurrentView::Disk,
+        CurrentView::Apps,
         CurrentView::Procs,
         CurrentView::Ports,
         CurrentView::Power,
