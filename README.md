@@ -33,6 +33,7 @@ Minimalista y pensado para dejarlo siempre abierto: por defecto cada pestaña mu
 | `s` | En Procesos: cambiar orden (CPU %, RAM MB, PID, Nombre) |
 | `↑` / `↓` / `k` / `j` | Mover la fila seleccionada (Procesos y Puertos) |
 | `PgUp` / `PgDown` | Mover 10 filas |
+| `u` | Actualizar, si hay una versión nueva |
 | `?` / `h` | Mostrar / ocultar ayuda |
 | `q` / `Esc` / `Ctrl+C` | Salir |
 
@@ -64,16 +65,26 @@ cargo run -- -v procs
 
 ### Descarga (Releases)
 
-Cada versión publicada en [Releases](https://github.com/karlosg3/TTManager/releases) incluye un binario para Linux x86_64:
+Cada versión publicada en [Releases](https://github.com/karlosg3/TTManager/releases) incluye, para Linux x86_64, un paquete `.deb` y un binario suelto:
 
 ```bash
+# Debian, Ubuntu, Pop!_OS, Mint…
+sudo apt install ./ttm_X.Y.Z_amd64.deb
+
+# Cualquier distribución
 tar -xzf ttm-vX.Y.Z-linux-x86_64.tar.gz
-./ttm
+cp ttm-vX.Y.Z-linux-x86_64/ttm ~/.local/bin/
 ```
+
+### Actualizaciones
+
+Al arrancar, `ttm` consulta GitHub en segundo plano (como mucho una vez al día) y, si hay una versión nueva, pregunta si quieres instalarla: `s` sí, `n` no avisar más de esa versión, `Esc` más tarde (luego con `u`). También se puede actualizar con `ttm --update`.
+
+El método depende de cómo se instaló: con el `.deb` usa `sudo apt install`, con el binario suelto lo reemplaza (verificando su SHA-256) y con `cargo install` recompila desde el tag. Para desactivar la consulta: `ttm --no-update-check` o `TTM_NO_UPDATE_CHECK=1`.
 
 ### Publicar una versión
 
-Los releases son automáticos: al fusionar en `main` un cambio que suba `version` en `Cargo.toml` (por ejemplo a `0.2.0`), el workflow `Release` crea el tag `v0.2.0`, compila y publica el binario. Si la versión ya tiene tag, no hace nada.
+Los releases son automáticos: al fusionar en `main` un cambio que suba `version` en `Cargo.toml` (por ejemplo a `0.2.0`), el workflow `Release` crea el tag `v0.2.0`, compila y publica el binario, el `.deb` y sus checksums. Si la versión ya tiene tag, no hace nada.
 
 ### Compilación para Producción
 
@@ -98,7 +109,8 @@ ttm/
     ├── disk.rs     # Detección de discos y particiones montadas
     ├── gpu.rs      # Detección y muestreo de GPU (AMD sysfs, NVIDIA SMI, Intel, lspci)
     ├── net.rs      # Mapeo de sockets y puertos locales a PIDs (/proc/net, /proc/*/fd)
-    └── power.rs    # Batería, salud y adaptador de corriente (/sys/class/power_supply)
+    ├── power.rs    # Batería, salud y adaptador de corriente (/sys/class/power_supply)
+    └── updater.rs  # Búsqueda de versiones en GitHub Releases y autoactualización
 ```
 
 ---

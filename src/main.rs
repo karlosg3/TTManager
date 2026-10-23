@@ -4,6 +4,7 @@ mod gpu;
 mod net;
 mod power;
 mod ui;
+mod updater;
 
 use std::error::Error;
 use std::io;
@@ -30,10 +31,23 @@ struct Cli {
     /// Vista inicial: home, cpu, ram, gpu, disk, procs, ports, power
     #[arg(short, long, default_value = "home")]
     view: String,
+
+    /// Buscar e instalar la última versión y salir
+    #[arg(long)]
+    update: bool,
+
+    /// No buscar actualizaciones al arrancar (también: TTM_NO_UPDATE_CHECK=1)
+    #[arg(long)]
+    no_update_check: bool,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Cli::parse();
+
+    // `ttm --update` no abre la TUI
+    if args.update {
+        update_and_exit();
+    }
 
     // Hook to ensure terminal is cleanly restored on unexpected panic
     let original_hook = std::panic::take_hook();
@@ -51,6 +65,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new();
+    if !args.no_update_check && std::env::var_os("TTM_NO_UPDATE_CHECK").is_none() {
+        app.start_update_check();
+    }
 
     // Set initial view from CLI arguments
     match args.view.to_lowercase().as_str() {
@@ -91,6 +108,17 @@ fn main() -> Result<(), Box<dyn Error>> {
                 break;
             }
 
+            // Con el aviso de actualización abierto, solo cuentan sus teclas
+            if app.show_update_prompt {
+                match key.code {
+                    KeyCode::Char('s' | 'S' | 'y' | 'Y') | KeyCode::Enter => app.accept_update(),
+                    KeyCode::Char('n' | 'N') => app.decline_update(),
+                    KeyCode::Esc => app.postpone_update(),
+                    _ => {}
+                }
+                continue;
+            }
+
             match key.code {
                 KeyCode::Char('q') => app.quit(),
                 KeyCode::Esc => {
@@ -101,6 +129,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }
                 }
                 KeyCode::Char('?') | KeyCode::Char('h') => app.toggle_help(),
+                KeyCode::Char('u') | KeyCode::Char('U') => app.open_update_prompt(),
                 KeyCode::Char('c') | KeyCode::Char('C') => app.toggle_cpu_mode(),
                 KeyCode::Char('d') | KeyCode::Char('D') => app.toggle_expanded(),
                 KeyCode::Char('s') | KeyCode::Char('S') => app.toggle_process_sort(),
@@ -139,5 +168,20 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
     terminal.show_cursor()?;
 
+    // La terminal ya está restaurada: el instalador puede imprimir y pedir sudo
+    if app.update_accepted {
+        update_and_exit();
+    }
+
     Ok(())
+}
+
+fn update_and_exit() -> ! {
+    match updater::run_update() {
+        Ok(()) => std::process::exit(0),
+        Err(e) => {
+            eprintln!("No se pudo actualizar: {e}");
+            std::process::exit(1);
+        }
+    }
 }
