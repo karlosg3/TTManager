@@ -10,13 +10,14 @@ Minimalista y pensado para dejarlo siempre abierto: por defecto cada pestaña mu
 
 | Pestaña | Vista compacta (por defecto) | Con detalle (`d`) |
 | :--- | :--- | :--- |
-| **1 Inicio** | Logo, sistema, CPU/GPU y barras de CPU, RAM, SWAP y GPU | Mini-gráficas de historial, núcleos, VRAM, procesos y puertos |
+| **1 Inicio** | Logo, sistema, CPU/GPU y barras de CPU, RAM, SWAP, GPU, disco y batería | Mini-gráficas de historial, núcleos, VRAM, procesos y puertos |
 | **2 CPU** | Modelo, núcleos, barra de uso y mini-gráfica | Gráfica de 60 s y estadísticas; `c` alterna vista por núcleo |
 | **3 Memoria** | Barras de RAM y SWAP con mini-gráficas | Gráficas duales y desglose (total, en uso, disponible, libre) |
 | **4 GPU** | Modelo, driver, uso del motor, temperatura y VRAM | Gráfica de 60 s, VRAM, GTT y sensores |
 | **5 Disco** | Una barra por disco con usado, libre y total | Tabla con montaje, dispositivo, sistema de archivos y tipo |
 | **6 Procesos** | Los 6 primeros, con orden configurable (`s`) | Tabla completa a pantalla completa |
 | **7 Puertos** | Los 6 primeros puertos en escucha | Tabla completa a pantalla completa |
+| **8 Energía** | Fuente (batería, cargador o corriente directa), carga, salud, consumo y tiempo restante | Gráfica de 60 s, energía actual/máxima/de fábrica, ciclos, voltaje y modelo |
 
 ---
 
@@ -24,7 +25,7 @@ Minimalista y pensado para dejarlo siempre abierto: por defecto cada pestaña mu
 
 | Atajo | Acción |
 | :--- | :--- |
-| `1`-`7` | Ir directamente a una pestaña |
+| `1`-`8` | Ir directamente a una pestaña |
 | `Tab` / `→` | Pestaña siguiente |
 | `Shift+Tab` / `←` | Pestaña anterior |
 | `d` | Desplegar / ocultar el detalle de la pestaña actual |
@@ -56,7 +57,7 @@ cargo run
 # Cambiar intervalo de actualización a 500 ms
 cargo run -- -i 500
 
-# Iniciar directamente en otra pestaña: home, cpu, ram, gpu, disk, procs, ports
+# Iniciar directamente en otra pestaña: home, cpu, ram, gpu, disk, procs, ports, power
 cargo run -- -v cpu
 cargo run -- -v procs
 ```
@@ -96,7 +97,8 @@ ttm/
     ├── ui.rs       # Renderizado de componentes visuales, layouts y widgets Ratatui
     ├── disk.rs     # Detección de discos y particiones montadas
     ├── gpu.rs      # Detección y muestreo de GPU (AMD sysfs, NVIDIA SMI, Intel, lspci)
-    └── net.rs      # Mapeo de sockets y puertos locales a PIDs (/proc/net, /proc/*/fd)
+    ├── net.rs      # Mapeo de sockets y puertos locales a PIDs (/proc/net, /proc/*/fd)
+    └── power.rs    # Batería, salud y adaptador de corriente (/sys/class/power_supply)
 ```
 
 ---

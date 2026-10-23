@@ -13,6 +13,7 @@ use ratatui::{
 };
 
 use crate::app::{App, CpuMode, CurrentView};
+use crate::power::{Battery, ChargeState, PowerInfo};
 
 const GIB: f64 = 1_073_741_824.0;
 const ACCENT: Color = Color::Cyan;
@@ -52,6 +53,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         CurrentView::Disk => draw_disk(f, app, body),
         CurrentView::Procs => draw_procs(f, app, body),
         CurrentView::Ports => draw_ports(f, app, body),
+        CurrentView::Power => draw_power(f, app, body),
     }
 
     draw_footer(f, app, chunks[2]);
@@ -92,11 +94,36 @@ fn dim(text: impl Into<String>) -> Span<'static> {
 
 /// Barra delgada: tramo lleno con color por nivel, resto atenuado.
 fn bar(pct: u64, width: usize) -> Vec<Span<'static>> {
+    colored_bar(pct, width, level_color(pct))
+}
+
+fn colored_bar(pct: u64, width: usize, color: Color) -> Vec<Span<'static>> {
     let filled = (pct.min(100) as usize * width + 50) / 100;
     vec![
-        Span::styled("━".repeat(filled), Style::default().fg(level_color(pct))),
+        Span::styled("━".repeat(filled), Style::default().fg(color)),
         dim("━".repeat(width - filled)),
     ]
+}
+
+/// Al revés que el uso: en batería y salud lo preocupante es un valor bajo
+fn charge_color(pct: u64) -> Color {
+    if pct <= 15 {
+        Color::Red
+    } else if pct <= 35 {
+        Color::Yellow
+    } else {
+        Color::Green
+    }
+}
+
+fn charge_metric(name: &str, pct: u64, detail: String, bar_width: usize) -> Line<'static> {
+    let mut spans = vec![label(name)];
+    spans.extend(colored_bar(pct, bar_width, charge_color(pct)));
+    spans.push(Span::raw(format!(" {pct:>3}%")));
+    if !detail.is_empty() {
+        spans.push(dim(format!("  {detail}")));
+    }
+    Line::from(spans)
 }
 
 fn metric(name: &str, pct: u64, detail: String, bar_width: usize) -> Line<'static> {
@@ -201,6 +228,17 @@ fn bar_width(area: Rect) -> usize {
         .clamp(8, 70)
 }
 
+/// Duración legible: "1 h 05 min" o "12 min"
+fn duration(secs: u64) -> String {
+    let hours = secs / 3600;
+    let mins = (secs % 3600) / 60;
+    if hours > 0 {
+        format!("{hours} h {mins:02} min")
+    } else {
+        format!("{mins} min")
+    }
+}
+
 fn hint(text: &str) -> Line<'static> {
     Line::from(dim(text.to_string()))
 }
@@ -244,7 +282,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let mut hints = vec![
-        "1-7 pestañas".to_string(),
+        "1-8 pestañas".to_string(),
         "←/→ navegar".to_string(),
         format!("d detalle [{}]", if app.expanded { "on" } else { "off" }),
     ];
@@ -384,6 +422,25 @@ fn home_lines(app: &App, area: Rect) -> Vec<Line<'static>> {
             format!("{}/{}", size(disk.used()), size(disk.total)),
             bw,
         ));
+    }
+
+    match app.power.battery() {
+        Some(bat) => {
+            let mut detail = app.power.summary();
+            if let Some(w) = bat.power_w.filter(|w| *w > 0.0) {
+                detail.push_str(&format!(" · {w:.1} W"));
+            }
+            lines.push(charge_metric(
+                "BATERÍA",
+                bat.capacity.unwrap_or(0),
+                detail,
+                bw,
+            ));
+            if app.expanded {
+                lines.push(spark_line(&app.battery_history, spark_w));
+            }
+        }
+        None => lines.push(kv("ENERGÍA", app.power.summary())),
     }
 
     if app.expanded {
@@ -893,6 +950,123 @@ fn draw_ports(f: &mut Frame, app: &App, area: Rect) {
 }
 
 // ---------------------------------------------------------------------------
+// Energía
+// ---------------------------------------------------------------------------
+
+fn draw_power(f: &mut Frame, app: &App, area: Rect) {
+    let power = &app.power;
+    let Some(bat) = power.battery() else {
+        let lines = vec![
+            kv("Fuente", power.source().label()),
+            Line::from(""),
+            hint("no se detectó batería: equipo de escritorio siempre conectado"),
+        ];
+        f.render_widget(Paragraph::new(lines), area);
+        return;
+    };
+
+    if !app.expanded {
+        let spark_w = (area.width as usize).saturating_sub(LABEL_WIDTH).min(60);
+        let mut lines = power_summary(power, bat, bar_width(area));
+        lines.insert(2, spark_line(&app.battery_history, spark_w));
+        lines.push(Line::from(""));
+        lines.push(hint("d gráfica y detalle de la batería"));
+        f.render_widget(Paragraph::new(lines), area);
+        return;
+    }
+
+    let chunks = Layout::vertical([Constraint::Min(6), Constraint::Length(5)]).split(area);
+    let capacity = bat.capacity.unwrap_or(0);
+    let data = series(&app.battery_history);
+    f.render_widget(
+        history_chart(
+            format!(" Batería {capacity}% · {} ", power.summary()),
+            &data,
+            charge_color(capacity),
+        ),
+        chunks[0],
+    );
+
+    let na = || "N/D".to_string();
+    let wh = |v: Option<f64>| v.map(|v| format!("{v:.1} Wh")).unwrap_or_else(na);
+    let or_na = |s: &str| if s.is_empty() { na() } else { s.to_string() };
+    render_columns(
+        f,
+        chunks[1].inner(Margin::new(1, 0)),
+        vec![
+            vec![
+                kv("Fuente", power.source().label()),
+                kv("Estado", bat.state().label()),
+                kv(
+                    "Consumo",
+                    bat.power_w.map(|w| format!("{w:.2} W")).unwrap_or_else(na),
+                ),
+                kv("Restante", time_left(bat).unwrap_or_else(na)),
+                kv(
+                    "Salud",
+                    bat.health().map(|h| format!("{h}%")).unwrap_or_else(na),
+                ),
+            ],
+            vec![
+                kv("Energía", wh(bat.energy_now_wh)),
+                kv("Máxima", wh(bat.energy_full_wh)),
+                kv("De fábrica", wh(bat.energy_design_wh)),
+                kv(
+                    "Ciclos",
+                    bat.cycles.map(|c| c.to_string()).unwrap_or_else(na),
+                ),
+                kv(
+                    "Voltaje",
+                    bat.voltage_v
+                        .map(|v| format!("{v:.2} V"))
+                        .unwrap_or_else(na),
+                ),
+            ],
+            vec![
+                kv("Batería", bat.name.clone()),
+                kv("Modelo", or_na(&bat.model)),
+                kv("Fabricante", or_na(&bat.manufacturer)),
+                kv("Tecnología", or_na(&bat.technology)),
+            ],
+        ],
+    );
+}
+
+fn power_summary(power: &PowerInfo, bat: &Battery, bw: usize) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        kv("Fuente", power.source().label()),
+        charge_metric("Carga", bat.capacity.unwrap_or(0), power.summary(), bw),
+    ];
+    if let Some(health) = bat.health() {
+        lines.push(charge_metric(
+            "Salud",
+            health,
+            bat.cycles
+                .map(|c| format!("{c} ciclos"))
+                .unwrap_or_default(),
+            bw,
+        ));
+    }
+    if let Some(w) = bat.power_w.filter(|w| *w > 0.0) {
+        lines.push(kv("Consumo", format!("{w:.1} W")));
+    }
+    if let Some(left) = time_left(bat) {
+        lines.push(kv("Restante", left));
+    }
+    lines
+}
+
+fn time_left(bat: &Battery) -> Option<String> {
+    let secs = bat.time_left_secs()?;
+    let goal = if bat.state() == ChargeState::Charging {
+        "para cargarse"
+    } else {
+        "de batería"
+    };
+    Some(format!("{} {goal}", duration(secs)))
+}
+
+// ---------------------------------------------------------------------------
 // Ayuda
 // ---------------------------------------------------------------------------
 
@@ -918,7 +1092,7 @@ fn draw_help_modal(f: &mut Frame, area: Rect) {
     };
 
     let text = vec![
-        key("1-7", "Ir a una pestaña"),
+        key("1-8", "Ir a una pestaña"),
         key("Tab / ← / →", "Pestaña siguiente / anterior"),
         key("d", "Desplegar / ocultar detalle de la pestaña"),
         key("c", "CPU: alternar global / por núcleo"),

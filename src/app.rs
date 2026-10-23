@@ -5,6 +5,7 @@ use sysinfo::{ProcessesToUpdate, System};
 use crate::disk::{DiskItem, collect_disks};
 use crate::gpu::{GpuCollector, GpuInfo};
 use crate::net::{PortItem, collect_listening_ports};
+use crate::power::{PowerInfo, collect_power};
 
 const HISTORY_CAPACITY: usize = 60;
 
@@ -17,10 +18,11 @@ pub enum CurrentView {
     Disk,  // Almacenamiento
     Procs, // Tabla de procesos
     Ports, // Tabla de puertos en escucha
+    Power, // Batería y fuente de energía
 }
 
 impl CurrentView {
-    pub const ALL: [CurrentView; 7] = [
+    pub const ALL: [CurrentView; 8] = [
         CurrentView::Home,
         CurrentView::Cpu,
         CurrentView::Ram,
@@ -28,6 +30,7 @@ impl CurrentView {
         CurrentView::Disk,
         CurrentView::Procs,
         CurrentView::Ports,
+        CurrentView::Power,
     ];
 
     pub fn title(self) -> &'static str {
@@ -39,6 +42,7 @@ impl CurrentView {
             CurrentView::Disk => "Disco",
             CurrentView::Procs => "Procesos",
             CurrentView::Ports => "Puertos",
+            CurrentView::Power => "Energía",
         }
     }
 
@@ -107,6 +111,7 @@ pub struct App {
     pub gpu_history: VecDeque<u64>,
     pub swap_history: VecDeque<u64>,
     pub per_core_history: Vec<VecDeque<u64>>,
+    pub battery_history: VecDeque<u64>,
 
     pub sys: System,
     pub gpu_collector: GpuCollector,
@@ -114,6 +119,7 @@ pub struct App {
     pub processes: Vec<ProcessItem>,
     pub ports: Vec<PortItem>,
     pub disks: Vec<DiskItem>,
+    pub power: PowerInfo,
 
     pub process_sort: ProcessSort,
     pub process_table_state: usize,
@@ -122,6 +128,7 @@ pub struct App {
     last_proc_update: Instant,
     last_net_update: Instant,
     last_disk_update: Instant,
+    last_power_update: Instant,
 }
 
 impl App {
@@ -199,6 +206,11 @@ impl App {
         gpu_history.push_back(initial_gpu);
 
         let ports = collect_listening_ports(&sys);
+        let power = collect_power();
+        let mut battery_history = VecDeque::with_capacity(HISTORY_CAPACITY);
+        if let Some(capacity) = power.battery().and_then(|b| b.capacity) {
+            battery_history.push_back(capacity);
+        }
 
         let mut app = Self {
             current_view: CurrentView::Home,
@@ -211,18 +223,21 @@ impl App {
             gpu_history,
             swap_history,
             per_core_history,
+            battery_history,
             sys,
             gpu_collector,
             system_info,
             processes: Vec::new(),
             ports,
             disks: collect_disks(),
+            power,
             process_sort: ProcessSort::CpuDesc,
             process_table_state: 0,
             port_table_state: 0,
             last_proc_update: Instant::now(),
             last_net_update: Instant::now(),
             last_disk_update: Instant::now(),
+            last_power_update: Instant::now(),
         };
 
         app.update_processes();
@@ -288,6 +303,15 @@ impl App {
         if self.last_disk_update.elapsed().as_secs() >= 5 {
             self.disks = collect_disks();
             self.last_disk_update = Instant::now();
+        }
+
+        // Batería y adaptador: ~2 s, para que el consumo en vatios se vea vivo
+        if self.last_power_update.elapsed().as_millis() >= 2000 {
+            self.power = collect_power();
+            self.last_power_update = Instant::now();
+        }
+        if let Some(capacity) = self.power.battery().and_then(|b| b.capacity) {
+            push_history(&mut self.battery_history, capacity);
         }
     }
 
@@ -490,6 +514,7 @@ fn test_navigation_and_modes() {
         CurrentView::Disk,
         CurrentView::Procs,
         CurrentView::Ports,
+        CurrentView::Power,
         CurrentView::Home,
     ] {
         app.next_view();
@@ -497,7 +522,7 @@ fn test_navigation_and_modes() {
     }
 
     app.prev_view();
-    assert_eq!(app.current_view, CurrentView::Ports);
+    assert_eq!(app.current_view, CurrentView::Power);
 
     assert!(!app.expanded);
     app.toggle_expanded();

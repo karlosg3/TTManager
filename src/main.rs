@@ -2,6 +2,7 @@ mod app;
 mod disk;
 mod gpu;
 mod net;
+mod power;
 mod ui;
 
 use std::error::Error;
@@ -26,7 +27,7 @@ struct Cli {
     #[arg(short, long, default_value_t = 1000)]
     interval: u64,
 
-    /// Vista inicial: home, cpu, ram, gpu, disk, procs, ports
+    /// Vista inicial: home, cpu, ram, gpu, disk, procs, ports, power
     #[arg(short, long, default_value = "home")]
     view: String,
 }
@@ -59,6 +60,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         "disk" | "disco" | "storage" => app.set_view(CurrentView::Disk),
         "procs" | "procesos" => app.set_view(CurrentView::Procs),
         "ports" | "puertos" => app.set_view(CurrentView::Ports),
+        "power" | "energia" | "energía" | "battery" | "bateria" => {
+            app.set_view(CurrentView::Power)
+        }
         _ => app.set_view(CurrentView::Home),
     }
 
@@ -111,6 +115,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 KeyCode::Char('5') => app.set_view(CurrentView::Disk),
                 KeyCode::Char('6') => app.set_view(CurrentView::Procs),
                 KeyCode::Char('7') => app.set_view(CurrentView::Ports),
+                KeyCode::Char('8') => app.set_view(CurrentView::Power),
                 KeyCode::Up | KeyCode::Char('k') => app.scroll_up(),
                 KeyCode::Down | KeyCode::Char('j') => app.scroll_down(),
                 KeyCode::PageUp => app.page_up(),
