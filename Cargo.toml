@@ -1,6 +1,6 @@
 [package]
 name = "TTManager"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 authors = ["K4 <llamandoakalos@gmail.com>"]
 description = "TTM (TuiTaskManager): a lightweight Linux system resource monitor TUI written in Rust"
