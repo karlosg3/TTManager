@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::sync::mpsc::Receiver;
 use std::time::Instant;
 use sysinfo::{ProcessesToUpdate, System};
 
@@ -6,6 +7,7 @@ use crate::disk::{DiskItem, collect_disks};
 use crate::gpu::{GpuCollector, GpuInfo};
 use crate::net::{PortItem, collect_listening_ports};
 use crate::power::{PowerInfo, collect_power};
+use crate::updater::{self, Version};
 
 const HISTORY_CAPACITY: usize = 60;
 
@@ -125,6 +127,12 @@ pub struct App {
     pub process_table_state: usize,
     pub port_table_state: usize,
 
+    // Actualizaciones: versión nueva encontrada, aviso abierto y respuesta
+    pub update_available: Option<Version>,
+    pub show_update_prompt: bool,
+    pub update_accepted: bool,
+    update_rx: Option<Receiver<Version>>,
+
     last_proc_update: Instant,
     last_net_update: Instant,
     last_disk_update: Instant,
@@ -234,6 +242,10 @@ impl App {
             process_sort: ProcessSort::CpuDesc,
             process_table_state: 0,
             port_table_state: 0,
+            update_available: None,
+            show_update_prompt: false,
+            update_accepted: false,
+            update_rx: None,
             last_proc_update: Instant::now(),
             last_net_update: Instant::now(),
             last_disk_update: Instant::now(),
@@ -244,7 +256,19 @@ impl App {
         app
     }
 
+    /// Fuera de `new()` para que los tests no hagan peticiones de red
+    pub fn start_update_check(&mut self) {
+        self.update_rx = Some(updater::spawn_check());
+    }
+
     pub fn tick(&mut self) {
+        // try_recv no bloquea: si el hilo aún no respondió, seguimos
+        if let Some(version) = self.update_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.update_available = Some(version);
+            self.show_update_prompt = true;
+            self.update_rx = None;
+        }
+
         self.sys.refresh_cpu_usage();
         self.sys.refresh_memory();
         self.gpu_collector.update();
@@ -439,6 +463,29 @@ impl App {
 
     pub fn toggle_help(&mut self) {
         self.show_help = !self.show_help;
+    }
+
+    /// "Sí": se cierra la TUI y main.rs instala la actualización
+    pub fn accept_update(&mut self) {
+        self.update_accepted = true;
+        self.quit();
+    }
+
+    /// "No": no volver a avisar de esta versión
+    pub fn decline_update(&mut self) {
+        if let Some(version) = self.update_available.take() {
+            updater::skip(version);
+        }
+        self.show_update_prompt = false;
+    }
+
+    /// "Más tarde": se cierra el aviso pero sigue disponible con `u`
+    pub fn postpone_update(&mut self) {
+        self.show_update_prompt = false;
+    }
+
+    pub fn open_update_prompt(&mut self) {
+        self.show_update_prompt = self.update_available.is_some();
     }
 
     pub fn quit(&mut self) {

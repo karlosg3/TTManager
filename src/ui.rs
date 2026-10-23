@@ -14,6 +14,7 @@ use ratatui::{
 
 use crate::app::{App, CpuMode, CurrentView};
 use crate::power::{Battery, ChargeState, PowerInfo};
+use crate::updater::Version;
 
 const GIB: f64 = 1_073_741_824.0;
 const ACCENT: Color = Color::Cyan;
@@ -60,6 +61,11 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     if app.show_help {
         draw_help_modal(f, size);
+    }
+    if app.show_update_prompt
+        && let Some(version) = app.update_available
+    {
+        draw_update_modal(f, size, version);
     }
 }
 
@@ -281,11 +287,15 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
-    let mut hints = vec![
+    let mut hints = vec![];
+    if let Some(version) = app.update_available {
+        hints.push(format!("u actualizar a v{version}"));
+    }
+    hints.extend([
         "1-8 pestañas".to_string(),
         "←/→ navegar".to_string(),
         format!("d detalle [{}]", if app.expanded { "on" } else { "off" }),
-    ];
+    ]);
     match app.current_view {
         CurrentView::Cpu => hints.push("c núcleos".to_string()),
         CurrentView::Procs => {
@@ -1099,6 +1109,7 @@ fn draw_help_modal(f: &mut Frame, area: Rect) {
         key("s", "Procesos: cambiar orden"),
         key("↑ ↓ j k", "Mover fila (Procesos y Puertos)"),
         key("PgUp / PgDn", "Mover 10 filas"),
+        key("u", "Actualizar si hay una versión nueva"),
         key("? / h", "Mostrar u ocultar esta ayuda"),
         key("q / Esc", "Salir"),
     ];
@@ -1114,6 +1125,60 @@ fn draw_help_modal(f: &mut Frame, area: Rect) {
 
     f.render_widget(
         Paragraph::new(text).block(block).wrap(Wrap { trim: true }),
+        modal,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Aviso de actualización
+// ---------------------------------------------------------------------------
+
+fn centered(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width.saturating_sub(4));
+    let height = height.min(area.height.saturating_sub(2));
+    Rect::new(
+        area.width.saturating_sub(width) / 2,
+        area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    )
+}
+
+fn draw_update_modal(f: &mut Frame, area: Rect, version: Version) {
+    let modal = centered(area, 62, 9);
+    f.render_widget(Clear, modal);
+
+    let bold = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
+    let text = vec![
+        Line::from(vec![
+            Span::raw("Hay una nueva versión de ttm: "),
+            dim(format!("v{}", Version::current())),
+            Span::raw(" → "),
+            Span::styled(format!("v{version}"), bold),
+        ]),
+        Line::from(""),
+        Line::from("¿Quieres actualizar ahora? ttm se cerrará para instalarla."),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("[s]", bold),
+            Span::raw(" Sí   "),
+            Span::styled("[n]", bold),
+            Span::raw(" No, omitir esta versión   "),
+            Span::styled("[Esc]", bold),
+            Span::raw(" Luego"),
+        ]),
+    ];
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT))
+        .title(Span::styled(" Actualización disponible ", bold));
+
+    f.render_widget(
+        Paragraph::new(text)
+            .block(block.padding(ratatui::widgets::Padding::horizontal(1)))
+            .wrap(Wrap { trim: true }),
         modal,
     );
 }
@@ -1147,5 +1212,12 @@ mod tests {
         }
         app.show_help = true;
         render(&app, 80, 24);
+
+        app.show_help = false;
+        app.update_available = Version::parse("9.9.9");
+        app.show_update_prompt = true;
+        for (w, h) in [(100, 30), (40, 10), (10, 3)] {
+            render(&app, w, h);
+        }
     }
 }

@@ -48,14 +48,24 @@ jobs:
       if: steps.version.outputs.needed == 'true'
       run: cargo build --release --locked
 
+    - name: Install cargo-deb
+      if: steps.version.outputs.needed == 'true'
+      run: cargo install cargo-deb --locked
+
     - name: Package
       if: steps.version.outputs.needed == 'true'
       run: |
-        name="ttm-${{ steps.version.outputs.tag }}-linux-x86_64"
+        tag="${{ steps.version.outputs.tag }}"
+        name="ttm-$tag-linux-x86_64"
         mkdir "$name"
         cp target/release/ttm LICENSE README.md "$name/"
         tar -czf "$name.tar.gz" "$name"
         sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+
+        # .deb para Debian/Ubuntu/Pop!_OS, reutilizando el binario ya compilado
+        deb="ttm_${tag#v}_amd64.deb"
+        cargo deb --no-build --output "$deb"
+        sha256sum "$deb" > "$deb.sha256"
 
     - name: Publish release
       if: steps.version.outputs.needed == 'true'
@@ -66,4 +76,6 @@ jobs:
         files: |
           ttm-*.tar.gz
           ttm-*.tar.gz.sha256
+          ttm_*.deb
+          ttm_*.deb.sha256
         generate_release_notes: true
